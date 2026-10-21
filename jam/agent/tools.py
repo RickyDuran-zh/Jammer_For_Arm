@@ -101,6 +101,44 @@ TOOL_DEFS = [
     {
         "type": "function",
         "function": {
+            "name": "get_trend_history",
+            "description": "查看最近若干帧的运行趋势：全局 SNR、最高信道评分、目标信道。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "frames": {"type": "integer",
+                               "description": "回看帧数，默认 60，最大 900"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_channel_map_history",
+            "description": "查看最近若干帧的 10 信道状态历史（空/占/扰/叠）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "frames": {"type": "integer",
+                               "description": "回看帧数，默认 20，最大 300"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_system_info",
+            "description": "查询系统配置与运行信息：中心频率、端口、TDD 时序、阈值、运行时长、发射次数。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_status",
             "description": "查询当前跟踪状态：锁定信道、是否已发生跳频跟随、干扰参数、各信道占用评分。",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -127,6 +165,9 @@ class ToolBox:
             "set_center_frequency": self.set_center_frequency,
             "set_jam_params": self.set_jam_params,
             "analyze_situation": self.analyze_situation,
+            "get_trend_history": self.get_trend_history,
+            "get_channel_map_history": self.get_channel_map_history,
+            "query_system_info": self.query_system_info,
             "get_status": self.get_status,
             "get_channel_features": self.get_channel_features,
         }
@@ -182,6 +223,47 @@ class ToolBox:
             return "带宽必须是 160/320/480/640/1600 kHz"
         self.c.set_params(mode, power_db, bw_khz)
         return "参数已更新"
+
+    def get_trend_history(self, frames: int = 60, **_) -> str:
+        hist = self.c.trend_history(int(frames))
+        if not hist:
+            return "暂无趋势数据"
+        step = max(1, len(hist) // 12)
+        rows = hist[::step][-12:]
+        lines = ["帧 | SNR(dB) | 最高评分 | 目标"]
+        for f, s_, m, t in rows:
+            lines.append(f"{f} | {s_:.1f} | {m:.2f} | {t or '-'}")
+        snrs = [h[1] for h in hist]
+        scores = [h[2] for h in hist]
+        lines.append(f"区间：SNR {min(snrs):.1f}~{max(snrs):.1f} dB，"
+                     f"最高评分 {min(scores):.2f}~{max(scores):.2f}")
+        return "\n".join(lines)
+
+    def get_channel_map_history(self, frames: int = 20, **_) -> str:
+        hist = self.c.map_history(int(frames))
+        if not hist:
+            return "暂无信道历史"
+        names = {0: "空", 1: "占", 2: "扰", 3: "叠"}
+        lines = ["帧 | 1 2 3 4 5 6 7 8 9 10"]
+        for i, row in enumerate(hist[-12:]):
+            lines.append(f"{i + 1:>2} | " + " ".join(
+                names.get(int(v), "?") for v in row))
+        return "\n".join(lines)
+
+    def query_system_info(self, **_) -> str:
+        i = self.c.system_info()
+        return "\n".join([
+            f"中心 {i['center_mhz']:.3f} MHz ｜ {i['channels']} 信道 × "
+            f"{i['channel_khz']:.0f} kHz ｜ 采样 {i['sample_rate_msps']:.1f} MS/s",
+            f"端口：感知 {i['rx_port']} ｜ 干扰 {i['tx_port']} ｜ "
+            f"模拟信号 {i['victim_port']}",
+            f"TDD：干扰 {i['jam_ms']:.0f} ms ｜ 周期 {i['cycle_ms']:.1f} ms ｜ "
+            f"TX 增益 {i['tx_gain_db']:.0f} dB",
+            f"阈值 {i['thresholds'][0]:.2f}/{i['thresholds'][1]:.2f} ｜ "
+            f"释放 {i['release_frames']} 帧",
+            f"运行 {i['uptime_s']:.0f} 秒 ｜ 累计发射 {i['tx_frames']} 次 ｜ "
+            f"模式 {i['mode']}",
+        ])
 
     def analyze_situation(self, **_) -> str:
         st = self.c.status()

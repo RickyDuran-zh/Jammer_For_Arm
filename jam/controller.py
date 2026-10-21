@@ -4,6 +4,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -51,6 +52,10 @@ class JamController:
         self._noise_init: list[float] = []
         self._wave_preview = None
         self._wave_meta = '未发射'
+        self._trend_hist: deque = deque(maxlen=900)
+        self._map_hist: deque = deque(maxlen=300)
+        self._rx_fail = 0
+        self._started_at = time.time()
         self._last_lost_channel: int | None = None
 
         self.latest: SensingResult | None = None
@@ -194,8 +199,11 @@ class JamController:
             try:
                 frame = self.radio.sense_frame()
             except Exception as exc:
+                self._rx_fail += 1
                 time.sleep(0.05)
-                self._publish(error=f"rx: {exc}")
+                self._publish(error=f"rx({self._rx_fail}): {exc}")
+                if self._rx_fail >= 5:
+                    self._recover_radio()
                 return
 
             self._update_spectrum(frame)
@@ -211,6 +219,12 @@ class JamController:
                         noise_ref_power=self._noise_ref)
             self.latest = res
             self.frames += 1
+            self._rx_fail = 0
+            self._trend_hist.append((
+                self.frames, round(float(res.snr_est), 1),
+                round(float(res.score.max()), 3),
+                (self.tracker.target + 1) if self.tracker.target is not None else 0))
+            self._map_hist.append(res.channel_map.copy())
 
             masked = (covered_channels(self._prev_action, cfg, self._center_hz)
                       if self.full_duplex else set())
@@ -260,6 +274,41 @@ class JamController:
 
             self.last_cycle_ms = (time.perf_counter() - t0) * 1e3
             self._publish()
+
+    # ── 历史与自恢复 ──────────────────────────────────────────
+    def trend_history(self, frames: int = 120) -> list[tuple]:
+        return list(self._trend_hist)[-max(0, int(frames)):]
+
+    def map_history(self, frames: int = 40) -> list[list[int]]:
+        return [m.tolist() for m in list(self._map_hist)[-max(0, int(frames)):]]
+
+    def system_info(self) -> dict:
+        st = self.status()
+        return {
+            "center_mhz": st.get("center_mhz", 0),
+            "channels": self.cfg.num_channels,
+            "channel_khz": self.cfg.channel_width_hz / 1e3,
+            "sample_rate_msps": self.cfg.sense_rate / 1e6,
+            "rx_port": f"ch{self.cfg.rx_ch} {self.cfg.rx_antenna}",
+            "tx_port": f"ch{self.cfg.tx_ch} {self.cfg.tx_antenna}",
+            "victim_port": f"ch{self.cfg.victim_ch} {self.cfg.victim_antenna}",
+            "tx_gain_db": self.cfg.tx_gain_fixed,
+            "jam_ms": self.cfg.jam_on_s * 1e3,
+            "cycle_ms": st.get("cycle_ms", 0),
+            "thresholds": [self.cfg.on_threshold, self.cfg.off_threshold],
+            "release_frames": self.cfg.release_frames,
+            "uptime_s": round(time.time() - self._started_at, 1),
+            "tx_frames": st.get("tx_frames", 0),
+            "mode": st.get("mode", "-"),
+        }
+
+    def _recover_radio(self) -> None:
+        try:
+            self.radio.recover()
+            self._rx_fail = 0
+            self._publish(error="设备已尝试重新打开")
+        except Exception as exc:
+            self._publish(error=f"recover: {exc}")
 
     def _update_wave_preview(self, wave: np.ndarray, act: Action) -> None:
         step = max(1, len(wave) // 512)

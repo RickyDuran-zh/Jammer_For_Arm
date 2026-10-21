@@ -133,6 +133,36 @@ def test_closed_loop() -> None:
     check("最终锁定新信道7", st.get("target_ch") == 7, f"target={st.get('target_ch')}")
     check("闭环持续发射", st.get("tx_frames", 0) > 20, f"tx={st.get('tx_frames')}")
     check("单周期耗时", 0 < st.get("cycle_ms", 0) < 50, f"cycle={st.get('cycle_ms')}ms")
+    check("趋势历史有数据", len(ctrl.trend_history()) > 10,
+          f"n={len(ctrl.trend_history())}")
+    check("系统信息完整", ctrl.system_info().get("channels") == 10)
+
+
+def test_recovery() -> None:
+    class Flaky(MockDualRadio):
+        def __init__(self, cfg):
+            super().__init__(cfg)
+            self.n = 0
+            self.recovered = False
+
+        def sense_frame(self):
+            self.n += 1
+            if 3 <= self.n <= 7:
+                raise TimeoutError("simulated")
+            return super().sense_frame()
+
+        def recover(self):
+            self.recovered = True
+            self.n = 0
+
+    cfg = replace(JamConfig(), jam_on_s=0.004, sense_gap_s=0.001)
+    radio = Flaky(cfg)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    time.sleep(1.5)
+    ctrl.stop()
+    check("接收连续失败后自恢复", radio.recovered and ctrl.status().get("frames", 0) > 0,
+          f"recovered={radio.recovered} frames={ctrl.status().get('frames')}")
 
 
 def test_center_scan() -> None:
@@ -161,6 +191,7 @@ def main() -> int:
     test_sensing(); print("-" * 62)
     test_waveform(); print("-" * 62)
     test_closed_loop(); print("-" * 62)
+    test_recovery(); print("-" * 62)
     test_center_scan()
 
     failed = [r for r in _results if not r[1]]

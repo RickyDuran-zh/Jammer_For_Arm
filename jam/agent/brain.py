@@ -17,7 +17,9 @@ SYSTEM_PROMPT = """你是应急频谱管控干扰机的控制助手。系统会�
 2. 一句话里包含多个参数时，合并进同一次工具调用。
 3. 用户说"固定干扰/锁定在/就压着/不要跟着跳/别跟"→ start_fixed_jamming(channel=N)（锁死，不跟随）。
    用户说"跟踪/自动跟随/跟着它/压制某信道"→ start_tracking(channel=N)；说"自动找/自己找"→ start_tracking()。
-   用户问"态势/分析一下/当前情况"→ analyze_situation()。
+   用户问"态势/分析一下/当前情况"→ analyze_situation()；
+   问"趋势/最近怎么变"→ get_trend_history()；问"信道历史/流水"→ get_channel_map_history()；
+   问"配置/系统信息/硬件"→ query_system_info()。
 4. 用户没说参数就不要传，不要臆造默认值。
 5. 回复中文、简短（80 字内），说明实际执行了什么。
 
@@ -61,6 +63,15 @@ class JamAgent:
         if any(k in t for k in ("停止", "取消", "别干扰", "关闭干扰", "停掉")):
             return self.tools.stop_tracking()
 
+        if any(k in t for k in ("趋势", "最近怎么", "变化")):
+            return self.tools.get_trend_history()
+
+        if any(k in t for k in ("信道历史", "流水", "热力", "历史")):
+            return self.tools.get_channel_map_history()
+
+        if any(k in t for k in ("配置", "系统信息", "硬件", "版本", "运行多久")):
+            return self.tools.query_system_info()
+
         if any(k in t for k in ("态势", "分析", "评估")):
             return self.tools.analyze_situation()
 
@@ -82,6 +93,13 @@ class JamAgent:
         elif any(k in t for k in ("噪声", "限带")):
             mode = 0
 
+        m = re.search(r'(提高|增加|加|降低|减少|减)\s*(\d+(?:\.\d+)?)\s*(?:db|分贝)',
+                      t, re.I)
+        if m:
+            cur = float(self.controller.status().get("power_db", 10))
+            delta = float(m.group(2)) * (1 if m.group(1) in ("提高", "增加", "加") else -1)
+            return self.tools.set_jam_params(power_db=min(20.0, max(0.0, cur + delta)))
+
         power = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*(?:db|分贝)', t, re.I)
         if m:
@@ -96,6 +114,10 @@ class JamAgent:
         m = re.search(r'(?:信道|通道|频道|ch)\s*(\d+)', t, re.I) or re.search(r'(\d+)\s*号', t)
         if m:
             ch = int(m.group(1))
+
+        if any(k in t for k in ("切到", "换到", "切至")) and ch is not None:
+            return self.tools.start_fixed_jamming(ch, waveform_mode=mode,
+                                                  power_db=power, bw_khz=bw)
 
         start = any(k in t for k in ("跟踪", "干扰", "压制", "锁定", "打"))
         fixed = any(k in t for k in ("固定", "锁死", "不要跟", "别跟", "就压"))

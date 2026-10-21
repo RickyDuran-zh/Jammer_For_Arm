@@ -38,6 +38,9 @@ class DualRadio(ABC):
     def flush_rx(self) -> None:
         ...
 
+    def recover(self) -> None:
+        ...
+
     def close(self) -> None:
         ...
 
@@ -116,6 +119,7 @@ class UhdDualRadio(DualRadio):
         self._victim_stop = None
         self._victim_thread = None
         self._victim_plan: list[tuple[float, float]] = []
+        self._victim_amp = 0.05
         self._args = args or f"addr={cfg.ip_addr}"
 
         self.usrp = uhd.usrp.MultiUSRP(self._args)
@@ -285,6 +289,7 @@ class UhdDualRadio(DualRadio):
         if not plan:
             return
         self._victim_plan = sorted(plan, key=lambda x: x[0])
+        self._victim_amp = float(amp)
         self.usrp.set_tx_rate(cfg.sense_rate, cfg.victim_ch)
         self.usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(cfg.center_freq_hz),
                               cfg.victim_ch)
@@ -350,6 +355,42 @@ class UhdDualRadio(DualRadio):
             # 本振重调后会有几十毫秒的瞬态，多丢一些帧，避免被当成信号锁定
             time.sleep(0.02)
             self.drain(20)
+
+    def recover(self) -> None:
+        """RX 连续失败时尝试重开数据流，保留当前中心频率和模拟信号计划。"""
+        plan = list(self._victim_plan)
+        amp = self._victim_amp
+        center = self.center_hz
+
+        self._reader_stop.set()
+        if self._reader is not None:
+            self._reader.join(timeout=1.0)
+            self._reader = None
+        if self._victim_stop is not None:
+            self._victim_stop.set()
+            if self._victim_thread is not None:
+                self._victim_thread.join(timeout=1.0)
+                self._victim_thread = None
+            self._vtx = None
+        try:
+            cmd = self.uhd.types.StreamCMD(self.uhd.types.StreamMode.stop_cont)
+            cmd.stream_now = True
+            self._rx.issue_stream_cmd(cmd)
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+        self._rx = self._tx = None
+        self._tx_end_time = 0.0
+        self._min_time = 0.0
+        self._latest = None
+        time.sleep(0.2)
+
+        self._configure()
+        self._open_streams()
+        self.set_center(center)
+        if plan:
+            self.start_victim(plan, amp)
 
     def close(self) -> None:
         if self._victim_stop is not None:
