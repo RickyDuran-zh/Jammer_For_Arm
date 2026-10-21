@@ -1,6 +1,7 @@
 """PyQt5 控制台：实时频谱、信道评分、跟踪轨迹、Agent 对话。"""
 from __future__ import annotations
 
+import html
 import time
 from collections import deque
 
@@ -124,6 +125,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._trail: deque[tuple[int, float]] = deque(maxlen=600)
         self.wf_rows = 240
         self._wf_hist: deque = deque(maxlen=self.wf_rows)
+        self._trend: deque = deque(maxlen=600)
         self._last_center = 0.0
         self._last_event_sig = None
 
@@ -224,6 +226,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addLayout(mid, 4)
 
         tabs = QtWidgets.QTabWidget()
+        self.tabs = tabs
         log_tab = QtWidgets.QWidget()
         log_lay = QtWidgets.QVBoxLayout(log_tab)
         self.log = QtWidgets.QTableWidget(0, 4)
@@ -249,6 +252,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trail_curve = self.trail.plot(pen=pg.mkPen(ACCENT, width=2), connect="finite")
         trail_lay.addWidget(self.trail)
         tabs.addTab(trail_tab, "跟踪轨迹")
+
+        trend_tab = QtWidgets.QWidget()
+        trend_lay = QtWidgets.QVBoxLayout(trend_tab)
+        trend_lay.setSpacing(4)
+        snr_title = QtWidgets.QLabel("全局 SNR (dB)")
+        snr_title.setStyleSheet(f"color:{MUTED};font-size:11px;")
+        trend_lay.addWidget(snr_title)
+        self.trend_snr = pg.PlotWidget()
+        self.trend_snr.setBackground("#0e141c")
+        self.trend_snr.setYRange(0, 60)
+        for ax in ("left", "bottom"):
+            self.trend_snr.getAxis(ax).setPen(pg.mkPen(MUTED))
+            self.trend_snr.getAxis(ax).setTextPen(pg.mkPen(MUTED))
+        self.trend_snr_curve = self.trend_snr.plot(pen=pg.mkPen(ACCENT, width=1.6))
+        trend_lay.addWidget(self.trend_snr)
+
+        score_title = QtWidgets.QLabel("最高信道评分")
+        score_title.setStyleSheet(f"color:{MUTED};font-size:11px;")
+        trend_lay.addWidget(score_title)
+        self.trend_score = pg.PlotWidget()
+        self.trend_score.setBackground("#0e141c")
+        self.trend_score.setLabel("bottom", "帧")
+        self.trend_score.setYRange(0, 1.05)
+        for ax in ("left", "bottom"):
+            self.trend_score.getAxis(ax).setPen(pg.mkPen(MUTED))
+            self.trend_score.getAxis(ax).setTextPen(pg.mkPen(MUTED))
+        self.trend_score_curve = self.trend_score.plot(pen=pg.mkPen(AMBER, width=1.6))
+        self.trend_score.addItem(pg.InfiniteLine(pos=self.cfg.on_threshold, angle=0,
+                                                 pen=pg.mkPen("#6b7280", width=1,
+                                                              style=QtCore.Qt.DashLine)))
+        trend_lay.addWidget(self.trend_score)
+        tabs.addTab(trend_tab, "运行趋势")
+
+        wave_tab = QtWidgets.QWidget()
+        wave_lay = QtWidgets.QVBoxLayout(wave_tab)
+        self.wave_info = QtWidgets.QLabel("未发射")
+        self.wave_info.setStyleSheet(f"color:{MUTED};font-size:12px;")
+        wave_lay.addWidget(self.wave_info)
+        self.wave_plot = pg.PlotWidget()
+        self.wave_plot.setBackground("#0e141c")
+        self.wave_plot.setLabel("bottom", "时间 (ms)")
+        self.wave_plot.setLabel("left", "幅度")
+        self.wave_plot.getAxis("left").enableAutoSIPrefix(False)
+        self.wave_plot.setYRange(0, 0.3)
+        for ax in ("left", "bottom"):
+            self.wave_plot.getAxis(ax).setPen(pg.mkPen(MUTED))
+            self.wave_plot.getAxis(ax).setTextPen(pg.mkPen(MUTED))
+        self.wave_curve = self.wave_plot.plot(pen=pg.mkPen("#8ab4f8", width=1.2))
+        wave_lay.addWidget(self.wave_plot)
+        tabs.addTab(wave_tab, "干扰波形")
         left.addWidget(tabs, 3)
 
         root.addLayout(left, 5)
@@ -279,6 +332,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("限带噪声", lambda: self._cmd("mode", 0)),
             ("功率 +5", lambda: self._cmd("power", 5)),
             ("状态", lambda: self._cmd("status")),
+            ("态势报告", lambda: self._cmd("situation")),
         ]):
             btn = QtWidgets.QPushButton(label)
             btn.clicked.connect(fn)
@@ -337,8 +391,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── 交互 ─────────────────────────────────────────────────
     def _append(self, who: str, text: str):
         color = ACCENT if who == "系统" else ("#93c5fd" if who == "我" else TEXT)
+        body = html.escape(str(text)).replace("\n", "<br>")
         self.chat.append(f'<p style="margin:6px 0"><span style="color:{color}">'
-                         f'<b>{who}</b></span>　{text}</p>')
+                         f'<b>{who}</b></span>　{body}</p>')
 
     def _send(self):
         text = self.input.text().strip()
@@ -391,6 +446,8 @@ class MainWindow(QtWidgets.QMainWindow):
             new = min(20.0, max(0.0, cur + value))
             self.ctrl.set_params(power_db=new)
             self._append("系统", f"功率调整为 {new:.0f} dB。")
+        elif kind == "situation":
+            self._append("系统", self.agent.tools.analyze_situation())
         elif kind == "status":
             st = self.ctrl.status()
             target = st.get("target_ch")
@@ -464,10 +521,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self._render_waterfall()
 
         target = st.get("target_ch")
-        self._trail.append((st.get("frames", 0), target if target else np.nan))
+        frame = st.get("frames", 0)
+        self._trail.append((frame, target if target else np.nan))
         xs = [p[0] for p in self._trail]
         ys = [p[1] for p in self._trail]
         self.trail_curve.setData(xs, ys)
+
+        snr = float(st.get("snr_est", 0) or 0)
+        mx = max(scores) if scores else 0.0
+        self._trend.append((frame, snr, mx))
+        tx = [p[0] for p in self._trend]
+        self.trend_snr_curve.setData(tx, [p[1] for p in self._trend])
+        self.trend_score_curve.setData(tx, [p[2] for p in self._trend])
+
+        wave = st.get("wave_preview") or []
+        if len(wave) >= 16:
+            self.wave_curve.setData(
+                np.linspace(0, self.cfg.jam_on_s * 1e3, len(wave)), wave)
+            self.wave_info.setText(st.get("wave_meta", ""))
+        else:
+            self.wave_curve.setData([], [])
+            self.wave_info.setText("未发射")
 
         ev = st.get("last_event")
         if ev:

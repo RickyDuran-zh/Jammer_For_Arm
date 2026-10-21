@@ -16,6 +16,7 @@ SYSTEM_PROMPT = """你是应急频谱管控干扰机的控制助手。系统会�
 1. 凡是涉及控制（开始/停止跟踪、改功率、改带宽、换波形），必须调用工具，不得凭空回复"已完成"。
 2. 一句话里包含多个参数时，合并进同一次工具调用。
 3. 用户说"跟踪/干扰/压制某信道"→ start_tracking(channel=N)；说"自动找/自己找/跟着它"→ start_tracking() 不带信道。
+   用户问"态势/分析一下/当前情况"→ analyze_situation()。
 4. 用户没说参数就不要传，不要臆造默认值。
 5. 回复中文、简短（80 字内），说明实际执行了什么。
 
@@ -58,6 +59,9 @@ class JamAgent:
 
         if any(k in t for k in ("停止", "取消", "别干扰", "关闭干扰", "停掉")):
             return self.tools.stop_tracking()
+
+        if any(k in t for k in ("态势", "分析", "评估")):
+            return self.tools.analyze_situation()
 
         if any(k in t for k in ("状态", "情况", "在哪", "跟踪到")):
             st = self.controller.status()

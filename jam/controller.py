@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .config import Action, JamConfig
+from .config import WAVEFORM_NAMES, Action, JamConfig
 from .dsp.sensing import SensingResult, covered_channels, sense, suppress_center_dc
 from .dsp.waveform import generate
 from .radio.dual import DualRadio
@@ -49,6 +49,8 @@ class JamController:
         self._scan_hold_until = 0.0
         self._noise_ref = float(cfg.noise_ref_power)
         self._noise_init: list[float] = []
+        self._wave_preview = None
+        self._wave_meta = '未发射'
         self._last_lost_channel: int | None = None
 
         self.latest: SensingResult | None = None
@@ -243,8 +245,11 @@ class JamController:
                 except Exception as exc:
                     self._publish(error=f"tx: {exc}")
                 self._prev_action = act
+                self._update_wave_preview(wave, act)
             else:
                 self._prev_action = None
+                self._wave_preview = None
+                self._wave_meta = "未发射"
                 time.sleep(cfg.jam_on_s)
 
             time.sleep(cfg.sense_gap_s)
@@ -255,6 +260,12 @@ class JamController:
 
             self.last_cycle_ms = (time.perf_counter() - t0) * 1e3
             self._publish()
+
+    def _update_wave_preview(self, wave: np.ndarray, act: Action) -> None:
+        step = max(1, len(wave) // 512)
+        self._wave_preview = np.abs(wave[::step])[:512]
+        self._wave_meta = (f"{WAVEFORM_NAMES.get(act.waveform_mode, '-')} · "
+                           f"{act.bw_khz:.0f} kHz · {act.power_db:.0f} dB")
 
     # ── 中心频率搜索 ──────────────────────────────────────────
     def _scan_once(self) -> None:
@@ -346,6 +357,9 @@ class JamController:
                      ("auto" if self._auto_track else "stopped")),
             "hop_latency_ms": self.last_hop_latency_ms,
             "noise_ref": round(self._noise_ref, 12) if self._noise_ref else 0.0,
+            "wave_meta": self._wave_meta,
+            "wave_preview": (self._wave_preview.tolist()
+                             if self._wave_preview is not None else []),
             "target_ch": (t.target + 1) if t.target is not None else None,
             "hop_count": t.hop_count,
             "frames": self.frames,
