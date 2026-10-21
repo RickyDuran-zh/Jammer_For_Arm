@@ -390,7 +390,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── 交互 ─────────────────────────────────────────────────
     def _append(self, who: str, text: str):
-        color = ACCENT if who == "系统" else ("#93c5fd" if who == "我" else TEXT)
+        if who == "系统":
+            color = ACCENT
+        elif who == "我":
+            color = "#93c5fd"
+        else:
+            color = AMBER          # Agent 用琥珀色，和正文白色区分
         body = html.escape(str(text)).replace("\n", "<br>")
         self.chat.append(f'<p style="margin:6px 0"><span style="color:{color}">'
                          f'<b>{who}</b></span>　{body}</p>')
