@@ -31,6 +31,27 @@ TOOL_DEFS = [
     {
         "type": "function",
         "function": {
+            "name": "start_fixed_jamming",
+            "description": "在指定信道上固定干扰：锁死该信道，不跟随对方切频，也不会自动释放。"
+                           "用户说“固定干扰/锁定在/就压着/不要跟着跳”时用这个，"
+                           "不要用 start_tracking。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "integer", "description": "信道 1-10（必填）"},
+                    "waveform_mode": {"type": "string", "enum": ["noise", "multitone"],
+                                      "description": "noise=限带噪声，multitone=多音"},
+                    "power_db": {"type": "number", "description": "发射功率 0-20 dB"},
+                    "bw_khz": {"type": "number", "enum": list(BW_CHOICES_KHZ),
+                               "description": "干扰带宽 kHz"},
+                },
+                "required": ["channel"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "stop_tracking",
             "description": "停止跟踪并停止发射干扰。",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -101,6 +122,7 @@ class ToolBox:
         self.c = controller
         self.handlers = {
             "start_tracking": self.start_tracking,
+            "start_fixed_jamming": self.start_fixed_jamming,
             "stop_tracking": self.stop_tracking,
             "set_center_frequency": self.set_center_frequency,
             "set_jam_params": self.set_jam_params,
@@ -110,6 +132,15 @@ class ToolBox:
         }
 
     # ── 工具实现 ──────────────────────────────────────────────
+    def start_fixed_jamming(self, channel, waveform_mode=None, power_db=None,
+                            bw_khz=None) -> str:
+        ch = int(channel)
+        if not 1 <= ch <= 10:
+            return "信道必须在 1-10 之间"
+        mode = _mode(waveform_mode) if waveform_mode is not None else None
+        self.c.start_fixed(ch, waveform_mode=mode, power_db=power_db, bw_khz=bw_khz)
+        return f"已在信道{ch}固定干扰（锁定，不跟随切频）。"
+
     def start_tracking(self, channel=None, waveform_mode=None, power_db=None,
                        bw_khz=None) -> str:
         mode = _mode(waveform_mode)

@@ -15,7 +15,8 @@ SYSTEM_PROMPT = """你是应急频谱管控干扰机的控制助手。系统会�
 规则：
 1. 凡是涉及控制（开始/停止跟踪、改功率、改带宽、换波形），必须调用工具，不得凭空回复"已完成"。
 2. 一句话里包含多个参数时，合并进同一次工具调用。
-3. 用户说"跟踪/干扰/压制某信道"→ start_tracking(channel=N)；说"自动找/自己找/跟着它"→ start_tracking() 不带信道。
+3. 用户说"固定干扰/锁定在/就压着/不要跟着跳/别跟"→ start_fixed_jamming(channel=N)（锁死，不跟随）。
+   用户说"跟踪/自动跟随/跟着它/压制某信道"→ start_tracking(channel=N)；说"自动找/自己找"→ start_tracking()。
    用户问"态势/分析一下/当前情况"→ analyze_situation()。
 4. 用户没说参数就不要传，不要臆造默认值。
 5. 回复中文、简短（80 字内），说明实际执行了什么。
@@ -97,7 +98,11 @@ class JamAgent:
             ch = int(m.group(1))
 
         start = any(k in t for k in ("跟踪", "干扰", "压制", "锁定", "打"))
-        if start:
+        fixed = any(k in t for k in ("固定", "锁死", "不要跟", "别跟", "就压"))
+        if start or fixed:
+            if fixed and ch is not None:
+                return self.tools.start_fixed_jamming(ch, waveform_mode=mode,
+                                                      power_db=power, bw_khz=bw)
             return self.tools.start_tracking(channel=ch, waveform_mode=mode,
                                              power_db=power, bw_khz=bw)
         if any(v is not None for v in (mode, power, bw)):
