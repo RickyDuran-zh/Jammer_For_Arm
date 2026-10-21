@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.workbuddy/
+ui_*.png
+*.log
+jam/agent/key_local.py
+font_test.png
