@@ -32,6 +32,12 @@ class DualRadio(ABC):
     def jam(self, samples: np.ndarray, gain_db: float, duration_s: float) -> None:
         ...
 
+    def start_victim(self, plan, amp: float = 0.05) -> None:
+        ...
+
+    def stop_victim(self) -> None:
+        ...
+
     def set_center(self, freq_hz: float) -> None:
         self.center_hz = freq_hz
 
@@ -59,6 +65,7 @@ class MockDualRadio(DualRadio):
         self.rng = np.random.default_rng(seed)
         self.t = np.arange(cfg.sense_samples) / cfg.sense_rate
         self.center_hz = cfg.center_freq_hz
+        self.victim_enabled = True
         self.victim_freq_hz = (victim_freq_hz
                                if victim_freq_hz is not None
                                else cfg.channel_centers_hz[2])   # 默认信道3
@@ -78,6 +85,24 @@ class MockDualRadio(DualRadio):
             self._hop_idx += 1
             self.victim_last_hop_s = time.monotonic()
 
+    def start_victim(self, plan, amp: float = 0.05) -> None:
+        ...
+
+    def stop_victim(self) -> None:
+        ...
+
+    def start_victim(self, plan, amp: float = 0.05) -> None:
+        self.hop_plan = sorted(plan, key=lambda x: x[0])
+        self._t0 = time.monotonic()
+        self._hop_idx = 0
+        if self.hop_plan:
+            self.victim_freq_hz = self.hop_plan[0][1]
+        self.victim_last_hop_s = time.monotonic()
+        self.victim_enabled = True
+
+    def stop_victim(self) -> None:
+        self.victim_enabled = False
+
     def set_center(self, freq_hz: float) -> None:
         self.center_hz = freq_hz
         self.center_history.append(freq_hz)
@@ -88,12 +113,13 @@ class MockDualRadio(DualRadio):
         x = 0.02 * (self.rng.standard_normal(cfg.sense_samples)
                     + 1j * self.rng.standard_normal(cfg.sense_samples))
 
-        off = self.victim_freq_hz - self.center_hz
-        if abs(off) <= cfg.sense_rate / 2 - 2 * cfg.channel_width_hz:
-            x += 0.45 * np.exp(1j * 2 * np.pi * off * self.t)
-            second = off + 4 * cfg.channel_width_hz
-            if abs(second) <= cfg.sense_rate / 2 - cfg.channel_width_hz:
-                x += 0.18 * np.exp(1j * 2 * np.pi * second * self.t)
+        if self.victim_enabled:
+            off = self.victim_freq_hz - self.center_hz
+            if abs(off) <= cfg.sense_rate / 2 - 2 * cfg.channel_width_hz:
+                x += 0.45 * np.exp(1j * 2 * np.pi * off * self.t)
+                second = off + 4 * cfg.channel_width_hz
+                if abs(second) <= cfg.sense_rate / 2 - cfg.channel_width_hz:
+                    x += 0.18 * np.exp(1j * 2 * np.pi * second * self.t)
         return x
 
     def jam(self, samples: np.ndarray, gain_db: float, duration_s: float) -> None:
@@ -120,6 +146,7 @@ class UhdDualRadio(DualRadio):
         self._victim_thread = None
         self._victim_plan: list[tuple[float, float]] = []
         self._victim_amp = 0.05
+        self._victim_on = False
         self._args = args or f"addr={cfg.ip_addr}"
 
         self.usrp = uhd.usrp.MultiUSRP(self._args)
@@ -316,6 +343,17 @@ class UhdDualRadio(DualRadio):
         self._victim_thread = threading.Thread(target=self._victim_loop,
                                                args=(amp,), name="victim-tx", daemon=True)
         self._victim_thread.start()
+        self._victim_on = True
+
+    def stop_victim(self) -> None:
+        if self._victim_stop is not None:
+            self._victim_stop.set()
+            if self._victim_thread is not None:
+                self._victim_thread.join(timeout=1.0)
+                self._victim_thread = None
+            self._victim_stop = None
+        self._vtx = None
+        self._victim_on = False
 
     def _victim_loop(self, amp: float) -> None:
         t = np.arange(32768) / self.cfg.sense_rate
@@ -361,17 +399,13 @@ class UhdDualRadio(DualRadio):
         plan = list(self._victim_plan)
         amp = self._victim_amp
         center = self.center_hz
+        was_victim = self._victim_on
 
         self._reader_stop.set()
         if self._reader is not None:
             self._reader.join(timeout=1.0)
             self._reader = None
-        if self._victim_stop is not None:
-            self._victim_stop.set()
-            if self._victim_thread is not None:
-                self._victim_thread.join(timeout=1.0)
-                self._victim_thread = None
-            self._vtx = None
+        self.stop_victim()
         try:
             cmd = self.uhd.types.StreamCMD(self.uhd.types.StreamMode.stop_cont)
             cmd.stream_now = True
@@ -389,16 +423,11 @@ class UhdDualRadio(DualRadio):
         self._configure()
         self._open_streams()
         self.set_center(center)
-        if plan:
+        if was_victim and plan:
             self.start_victim(plan, amp)
 
     def close(self) -> None:
-        if self._victim_stop is not None:
-            self._victim_stop.set()
-            if self._victim_thread is not None:
-                self._victim_thread.join(timeout=1.0)
-                self._victim_thread = None
-            self._vtx = None
+        self.stop_victim()
         self._reader_stop.set()
         if self._reader is not None:
             self._reader.join(timeout=1.0)

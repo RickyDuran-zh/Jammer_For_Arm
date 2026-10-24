@@ -38,32 +38,39 @@ def victim_plan(cfg: JamConfig, seed: int | None = None) -> list[tuple[float, fl
     return plan
 
 
-def _build(mock: bool, no_tx: bool, center_mhz: float):
+def _build(mock: bool, no_tx: bool, center_mhz: float, victim: bool):
     cfg = replace(JamConfig(), center_freq_hz=center_mhz * 1e6)
+    plan = victim_plan(cfg)
     if mock:
-        radio = MockDualRadio(cfg, hop_plan=victim_plan(cfg),
+        radio = MockDualRadio(cfg, hop_plan=plan,
                               victim_freq_hz=cfg.channel_centers_hz[2])
+        if not victim:
+            radio.stop_victim()
     else:
         radio = make_radio("uhd", cfg, tx_enabled=not no_tx)
-        if not no_tx:
-            radio.start_victim(victim_plan(cfg))
-    return cfg, radio
+    return cfg, radio, plan
 
 
 def run_ui(mock: bool = False, no_tx: bool = False,
-           center_mhz: float = 3000.0, fixed_ch: int | None = None) -> int:
+           center_mhz: float = 3000.0, fixed_ch: int | None = None,
+           victim: bool | None = None) -> int:
     from PyQt5 import QtWidgets
     from .ui.app import MainWindow
 
-    cfg, radio = _build(mock, no_tx, center_mhz)
-    ctrl = JamController(cfg, radio, on_event=_print_event)
+    if victim is None:
+        victim = mock          # 实机默认不开模拟信号
+    cfg, radio, plan = _build(mock, no_tx, center_mhz, victim)
+    ctrl = JamController(cfg, radio, on_event=_print_event, victim_plan=plan)
     ctrl.start()
+    if victim:
+        ctrl.set_victim(True)
     if fixed_ch:
         ctrl.start_fixed(fixed_ch)
 
     print("=" * 64)
     print(f"干扰机启动 | {'模拟后端' if mock else 'USRP X310'}"
-          f" | 子板1: RX2 感知 + TX/RX 干扰 | 子板2: 模拟信号（随机 4~8 s 跳频）"
+          f" | 子板1: RX2 感知 + TX/RX 干扰"
+          f" | 子板2: {'模拟信号（随机跳频）' if victim else '关闭'}"
           f" | 中心 {center_mhz:.3f} MHz")
     print("界面窗口已打开，关掉窗口即退出。")
     print("=" * 64, flush=True)
@@ -82,15 +89,21 @@ def run_ui(mock: bool = False, no_tx: bool = False,
 
 def run_console(mock: bool = False, no_tx: bool = False,
                 seconds: float = 10.0, center_mhz: float = 3000.0,
-                chat: bool = False, fixed_ch: int | None = None) -> None:
-    cfg, radio = _build(mock, no_tx, center_mhz)
-    ctrl = JamController(cfg, radio, on_event=_print_event)
+                chat: bool = False, fixed_ch: int | None = None,
+                victim: bool | None = None) -> None:
+    if victim is None:
+        victim = mock
+    cfg, radio, plan = _build(mock, no_tx, center_mhz, victim)
+    ctrl = JamController(cfg, radio, on_event=_print_event, victim_plan=plan)
     ctrl.start()
+    if victim:
+        ctrl.set_victim(True)
     if fixed_ch:
         ctrl.start_fixed(fixed_ch)
 
     print(f"干扰机启动 | 中心 {center_mhz:.3f} MHz | "
-          f"{'只感知' if no_tx else '感知+干扰'} | 按 Ctrl+C 结束")
+          f"{'只感知' if no_tx else '感知+干扰'} | "
+          f"模拟信号{'开' if victim else '关'} | 按 Ctrl+C 结束")
 
     try:
         if chat:

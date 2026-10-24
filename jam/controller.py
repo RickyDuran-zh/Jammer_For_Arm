@@ -19,7 +19,8 @@ class JamController:
     def __init__(self, cfg: JamConfig, radio: DualRadio,
                  policy: TrackerPolicy | None = None,
                  full_duplex: bool = False,
-                 on_event=None):
+                 on_event=None,
+                 victim_plan=None):
         self.cfg = cfg
         self.radio = radio
         self.tracker = Tracker(cfg.num_channels, policy or TrackerPolicy(
@@ -56,6 +57,8 @@ class JamController:
         self._map_hist: deque = deque(maxlen=300)
         self._rx_fail = 0
         self._started_at = time.time()
+        self._victim_plan = victim_plan
+        self._victim_on = False
         self._last_lost_channel: int | None = None
 
         self.latest: SensingResult | None = None
@@ -98,6 +101,10 @@ class JamController:
     def set_center(self, freq_hz: float) -> None:
         """切换中心频率：重调 ch0 收/发，清空目标后重新搜索。"""
         self._submit("center", {"freq_hz": float(freq_hz)})
+
+    def set_victim(self, enabled: bool) -> None:
+        """开/关子板2的模拟通信信号。"""
+        self._submit("victim", {"enabled": bool(enabled)})
 
     def stop_tracking(self) -> None:
         self._submit("stop", {})
@@ -158,6 +165,20 @@ class JamController:
                 self._next_scan_frame = self.frames
                 # 手动换中心后先在新频段停留 10 秒，不要立刻扫走
                 self._scan_hold_until = time.monotonic() + 10.0
+            elif cmd == "victim":
+                enabled = bool(p.get("enabled"))
+                try:
+                    if enabled:
+                        if self._victim_plan:
+                            self.radio.start_victim(self._victim_plan)
+                            self._victim_on = True
+                        else:
+                            self._publish(error="victim: 没有模拟信号计划")
+                    else:
+                        self.radio.stop_victim()
+                        self._victim_on = False
+                except Exception as exc:
+                    self._publish(error=f"victim: {exc}")
             elif cmd == "params":
                 if p.get("waveform_mode") is not None:
                     self._action.waveform_mode = int(p["waveform_mode"])
@@ -404,6 +425,7 @@ class JamController:
             "state": t.state.value,
             "mode": ("fixed" if self._hold else
                      ("auto" if self._auto_track else "stopped")),
+            "victim_on": self._victim_on,
             "hop_latency_ms": self.last_hop_latency_ms,
             "noise_ref": round(self._noise_ref, 12) if self._noise_ref else 0.0,
             "wave_meta": self._wave_meta,

@@ -1,8 +1,9 @@
 """入口。
 
-    python run.py            实机界面：子板1 感知+干扰，子板2 发模拟信号
+    python run.py            实机界面：子板1 感知+干扰（子板2 默认关闭）
     python run.py --mock     无硬件演示
     python run.py --no-tx    实机只感知，不发射
+    python run.py --victim   启动时打开子板2模拟信号
     python run.py --console  不开界面，命令行看状态
     python run.py --selftest 离线自检
 """
@@ -27,6 +28,8 @@ def main() -> int:
     ap.add_argument("--center", type=float, default=3000.0, help="中心频率 MHz")
     ap.add_argument("--fixed", type=int, default=None,
                     help="固定干扰某个信道（1-10），不自动跟随")
+    ap.add_argument("--victim", action="store_true", default=None,
+                    help="启动时打开子板2模拟信号（默认只在 --mock 下打开）")
     ap.add_argument("--chat", action="store_true", help="命令行模式下用自然语言控制")
     ap.add_argument("--selftest", action="store_true", help="离线自检")
     args = ap.parse_args()
@@ -35,9 +38,10 @@ def main() -> int:
         return selftest.main()
     if args.console:
         run_console(args.mock, args.no_tx, args.seconds, args.center, args.chat,
-                    args.fixed)
+                    args.fixed, victim=args.victim)
         return 0
-    return run_ui(args.mock, args.no_tx, args.center, args.fixed)
+    return run_ui(args.mock, args.no_tx, args.center, args.fixed,
+                  victim=args.victim)
 
 
 if __name__ == "__main__":

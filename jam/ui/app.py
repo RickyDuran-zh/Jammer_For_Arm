@@ -372,6 +372,11 @@ class MainWindow(QtWidgets.QMainWindow):
         center_row.addWidget(cbtn, 2)
         rlay.addLayout(center_row)
 
+        self.victim_btn = QtWidgets.QPushButton("模拟信号 关")
+        self.victim_btn.setCheckable(True)
+        self.victim_btn.toggled.connect(self._toggle_victim)
+        rlay.addWidget(self.victim_btn)
+
 
         row = QtWidgets.QHBoxLayout()
         self.input = QtWidgets.QLineEdit()
@@ -424,6 +429,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ch = int(self.ch_combo.currentText())
         self.ctrl.start_fixed(ch)
         self._append("系统", f"已在信道 {ch} 固定干扰（不自动跟随）。")
+
+    def _toggle_victim(self, checked: bool):
+        self.victim_btn.setText("模拟信号 开" if checked else "模拟信号 关")
+        self.ctrl.set_victim(checked)
+        self._append("系统", "子板2模拟信号已打开。" if checked
+                     else "子板2模拟信号已关闭。")
 
     def _set_center(self):
         text = self.center_spin.lineEdit().text().replace(",", "").strip()
@@ -485,6 +496,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.v_target.setText(f"信道 {st['target_ch']}" if st.get("target_ch") else "—")
         self.v_hop.setText(str(st.get("hop_count", 0)))
         self.v_center.setText(f"{st.get('center_mhz', 0):.3f} MHz")
+        von = bool(st.get("victim_on", False))
+        if self.victim_btn.isChecked() != von:
+            self.victim_btn.blockSignals(True)
+            self.victim_btn.setChecked(von)
+            self.victim_btn.setText("模拟信号 开" if von else "模拟信号 关")
+            self.victim_btn.blockSignals(False)
         le = self.center_spin.lineEdit()
         if le is None or not le.hasFocus():
             self.center_spin.blockSignals(True)
