@@ -111,9 +111,10 @@ def test_waveform() -> None:
     cfg = JamConfig()
     for mode in (0, 1):
         y, g = generate(Action(5, 12, 320, mode), cfg, 8192)
+        want = min(cfg.tx_peak_max, cfg.tx_peak_min * 10 ** (12 / 20))
         check(f"波形{mode}长度", y.size == 8192)
-        check(f"波形{mode}功率映射", abs(np.abs(y).max() - 0.25 * 10 ** (-8 / 20)) < 1e-9,
-              f"peak={np.abs(y).max():.4f}")
+        check(f"波形{mode}功率映射", abs(np.abs(y).max() - want) < 1e-6,
+              f"peak={np.abs(y).max():.4f} 期望={want:.4f}")
         check(f"波形{mode}增益固定", abs(g - cfg.tx_gain_fixed) < 1e-9)
 
 
@@ -183,14 +184,280 @@ def test_center_scan() -> None:
     check("扫描后恢复发射", st.get("tx_frames", 0) > 10, f"tx={st.get('tx_frames')}")
 
 
+def _wait_for(ctrl, cond, timeout: float = 3.0, poll: float = 0.03) -> bool:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            if cond(ctrl.status()):
+                return True
+        except Exception:
+            pass
+        time.sleep(poll)
+    return False
+
+
+def test_jam_modes() -> None:
+    """三种干扰模式：固定 / 随机 / 响应式。"""
+    cfg = replace(JamConfig(), jam_on_s=0.004, sense_gap_s=0.001)
+    centers = cfg.channel_centers_hz
+    radio = MockDualRadio(cfg, hop_plan=[(0.0, centers[2])],
+                          victim_freq_hz=centers[2], seed=11)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    try:
+        # ── 固定干扰 ──
+        ctrl.start_fixed(4)
+        ok = _wait_for(ctrl, lambda s: s.get("target_ch") == 4 and s.get("jam_mode") == "fixed")
+        check("固定模式已生效", ok,
+              f"mode={ctrl.status().get('jam_mode')} ch={ctrl.status().get('target_ch')}")
+        time.sleep(0.7)
+        st = ctrl.status()
+        check("固定模式目标不漂移", st.get("target_ch") == 4, f"target={st.get('target_ch')}")
+        check("固定模式持续发射", st.get("tx_frames", 0) > 5, f"tx={st.get('tx_frames')}")
+
+        # ── 随机干扰 ──
+        ctrl.start_random(period_s=0.4, channels=(1, 2, 3),
+                          power_min_db=5.0, power_max_db=10.0,
+                          bw_choices_khz=(160.0, 320.0))
+        check("随机模式已生效", _wait_for(ctrl, lambda s: s.get("jam_mode") == "random"),
+              f"mode={ctrl.status().get('jam_mode')}")
+        seq = []
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.8:     # 周期 0.6 s，留足 4 次抽样的余量
+            s = ctrl.status()
+            cur = (s.get("target_ch"), round(float(s.get("power_db") or 0)),
+                   round(float(s.get("bw_khz") or 0)))
+            if not seq or seq[-1] != cur:
+                seq.append(cur)
+            time.sleep(0.04)
+        chans = [c[0] for c in seq if c[0]]
+        check("随机模式会换信道/参数", len(seq) >= 3, f"序列={seq[:5]}")
+        check("随机模式多信道轮换", len(set(chans)) >= 2, f"chans={sorted(set(chans))}")
+        check("随机模式只落在许可信道", set(chans) <= {1, 2, 3}, f"chans={sorted(set(chans))}")
+        check("随机功率在设定区间",
+              all(5.0 <= c[1] <= 10.0 for c in seq if c[0]),
+              f"power={[c[1] for c in seq][:6]}")
+        check("随机带宽在可选集合",
+              all(c[2] in (160, 320) for c in seq if c[0]), f"bw={[c[2] for c in seq][:6]}")
+        check("随机模式持续发射", ctrl.status().get("tx_frames", 0) > 5)
+
+        # ── 响应式干扰 ──
+        ctrl.start_tracking(channel=5)
+        ok = _wait_for(ctrl, lambda s: s.get("jam_mode") == "track"
+                       and s.get("target_ch") == 5)
+        check("响应式模式已生效", ok,
+              f"mode={ctrl.status().get('jam_mode')} ch={ctrl.status().get('target_ch')}")
+
+        ctrl.stop_tracking()
+        check("停止后不再跟踪", _wait_for(ctrl, lambda s: not s.get("tracking")))
+        check("停止后仍标记为响应式", ctrl.status().get("jam_mode") == "track")
+    finally:
+        ctrl.stop()
+        radio.close()
+
+
+def _centroid_hz(y: np.ndarray, fs: float) -> float:
+    """频谱能量重心（Hz），用来判断基带能量到底落在哪个频率。"""
+    spec = np.abs(np.fft.fft(y)) ** 2
+    f = np.fft.fftfreq(len(y), 1.0 / fs)
+    total = float(spec.sum())
+    return float((f * spec).sum() / total) if total > 0 else 0.0
+
+
+def test_tx_lo_track() -> None:
+    """TX 本振跟踪：基带打 DC + 本振落在目标信道。"""
+    cfg = replace(JamConfig(), jam_on_s=0.004, sense_gap_s=0.001)
+    centers = cfg.channel_centers_hz
+
+    # 基带：本振跟随时，能量重心应在 0 Hz（用多音，重心严格等于中心）
+    y_dc, _ = generate(Action(0, 10, 320, 1), cfg, 4096,
+                       np.random.default_rng(3), baseband_offset_hz=0.0)
+    c_dc = _centroid_hz(y_dc, cfg.sense_rate)
+    check("跟踪模式基带对准 DC", abs(c_dc) < 1e3, f"重心={c_dc:.0f} Hz")
+
+    # 老做法：基带搬移到信道 1（-800 kHz）
+    y_off, _ = generate(Action(0, 10, 320, 1), cfg, 4096,
+                        np.random.default_rng(3), baseband_offset_hz=None)
+    c_off = _centroid_hz(y_off, cfg.sense_rate)
+    expect = float(centers[0] - cfg.center_freq_hz)
+    check("基带搬移模式仍可用", abs(c_off - expect) < 1e3,
+          f"重心={c_off:.0f} Hz 期望={expect:.0f} Hz")
+
+    # 电台：TX 频率应等于目标信道
+    radio = MockDualRadio(cfg, hop_plan=[(0.0, centers[2])],
+                          victim_freq_hz=centers[2], seed=5)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    try:
+        ctrl.start_fixed(1)
+        ok = _wait_for(ctrl, lambda s: s.get("tx_freq_mhz") is not None)
+        st = ctrl.status()
+        want = float(centers[0]) / 1e6
+        check("TX 本振调到信道1", ok and abs((st.get("tx_freq_mhz") or 0) - want) < 1e-3,
+              f"tx={st.get('tx_freq_mhz')} MHz 期望={want:.5f} MHz")
+
+        ctrl.start_fixed(9)
+        _wait_for(ctrl, lambda s: abs((s.get("tx_freq_mhz") or 0)
+                                      - float(centers[8]) / 1e6) < 1e-3, timeout=2.0)
+        st = ctrl.status()
+        want9 = float(centers[8]) / 1e6
+        check("换信道后本振跟着搬家",
+              abs((st.get("tx_freq_mhz") or 0) - want9) < 1e-3,
+              f"tx={st.get('tx_freq_mhz')} MHz 期望={want9:.5f} MHz")
+
+        # 关掉跟踪后应回落到基带搬移语义
+        cfg2 = replace(cfg, tx_lo_track=False)
+        radio2 = MockDualRadio(cfg2, hop_plan=[(0.0, centers[2])],
+                               victim_freq_hz=centers[2], seed=5)
+        ctrl2 = JamController(cfg2, radio2)
+        ctrl2.start()
+        try:
+            ctrl2.start_fixed(1)
+            time.sleep(0.5)
+            st2 = ctrl2.status()
+            check("关闭跟踪后不再报告 TX 频率",
+                  st2.get("tx_freq_mhz") is None and st2.get("tx_lo_track") is False,
+                  f"tx={st2.get('tx_freq_mhz')} track={st2.get('tx_lo_track')}")
+        finally:
+            ctrl2.stop()
+            radio2.close()
+    finally:
+        ctrl.stop()
+        radio.close()
+
+
+def test_react_delay() -> None:
+    """反应延迟：判定切频后，干扰要等设定时间才搬过去。"""
+    delay = 0.4
+    cfg = replace(JamConfig(), jam_on_s=0.004, sense_gap_s=0.001,
+                  react_delay_s=delay)
+    centers = cfg.channel_centers_hz
+    radio = MockDualRadio(cfg, hop_plan=[(0.0, centers[2]), (0.8, centers[6])],
+                          victim_freq_hz=centers[2], seed=9)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    t_track = t_jam = None
+    t0 = time.monotonic()
+    try:
+        while time.monotonic() - t0 < 4.0:
+            st = ctrl.status()
+            if t_track is None and st.get("target_ch") == 7:
+                t_track = time.monotonic()
+            if t_track is not None and t_jam is None and st.get("jam_target_ch") == 7:
+                t_jam = time.monotonic()
+                break
+            time.sleep(0.02)
+    finally:
+        ctrl.stop()
+        radio.close()
+
+    check("延迟期内跟踪与施扰不同步",
+          t_track is not None and t_jam is not None and t_jam > t_track,
+          f"锁定={t_track is not None} 施扰={t_jam is not None}")
+    gap = (t_jam - t_track) if (t_track and t_jam) else 0.0
+    check("施扰滞后约等于设定延迟", 0.30 <= gap <= 0.75,
+          f"实测 {gap * 1e3:.0f} ms，设定 {delay * 1e3:.0f} ms")
+
+
+def test_long_frame() -> None:
+    """长帧：一帧干扰的时长可调，且占空比要能报出来。"""
+    cfg = replace(JamConfig(), jam_on_s=0.12)
+    centers = cfg.channel_centers_hz
+    radio = MockDualRadio(cfg, hop_plan=[(0.0, centers[5])],
+                          victim_freq_hz=centers[5], seed=4)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    try:
+        ctrl.start_fixed(6)
+        ok = _wait_for(ctrl, lambda s: (s.get("tx_frames") or 0) >= 2, timeout=4.0)
+        st = ctrl.status()
+        check("帧长按设定生效", ok and abs((st.get("jam_on_ms") or 0) - 120) < 1,
+              f"jam_on={st.get('jam_on_ms')} ms")
+        check("占空比已上报", (st.get("duty_pct") or 0) > 50,
+              f"占空比={st.get('duty_pct')}% 周期={st.get('cycle_ms')} ms")
+        ctrl.set_params(jam_ms=30)
+        _wait_for(ctrl, lambda s: abs((s.get("jam_on_ms") or 0) - 30) < 1, timeout=3.0)
+        check("运行中可改帧长", abs((ctrl.status().get("jam_on_ms") or 0) - 30) < 1,
+              f"jam_on={ctrl.status().get('jam_on_ms')} ms")
+    finally:
+        ctrl.stop()
+        radio.close()
+
+
+def test_lo_hop() -> None:
+    """本振跳变：发射前搬到目标信道，发完搬回感知中心。"""
+
+    class HopMock(MockDualRadio):
+        supports_lo_hop = True
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.calls: list[float] = []
+
+        def set_center(self, freq_hz: float) -> None:
+            self.calls.append(float(freq_hz))
+            super().set_center(freq_hz)
+
+    cfg = replace(JamConfig(), jam_on_s=0.03, lo_hop=True)
+    centers = cfg.channel_centers_hz
+    radio = HopMock(cfg, hop_plan=[(0.0, centers[2])], victim_freq_hz=centers[2], seed=7)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    try:
+        ctrl.start_fixed(3)
+        ok = _wait_for(ctrl, lambda s: len(radio.calls) >= 4, timeout=4.0)
+        want_ch, want_home = float(centers[2]), float(cfg.center_freq_hz)
+        check("本振跳到目标信道", ok and abs(radio.calls[0] - want_ch) < 1e3,
+              f"首次={radio.calls[0] / 1e6 if radio.calls else 0:.4f} MHz")
+        check("发完搬回感知中心",
+              len(radio.calls) > 1 and abs(radio.calls[1] - want_home) < 1e3,
+              f"第二次={radio.calls[1] / 1e6 if len(radio.calls) > 1 else 0:.4f} MHz")
+    finally:
+        ctrl.stop()
+        radio.close()
+
+
+def test_park_tx() -> None:
+    """待机停放：不发射时把 TX 本振挪出观测频段，一旦发射立刻解除。"""
+
+    class ParkMock(MockDualRadio):
+        def park_tx(self):
+            self.tx_parked = True
+            return True
+
+    cfg = replace(JamConfig(), jam_on_s=0.02)
+    centers = cfg.channel_centers_hz
+    radio = ParkMock(cfg, hop_plan=[(0.0, centers[2])], victim_freq_hz=centers[2], seed=3)
+    ctrl = JamController(cfg, radio)
+    ctrl.start()
+    try:
+        ctrl.start_fixed(3)
+        _wait_for(ctrl, lambda s: (s.get("tx_frames") or 0) >= 2)
+        check("发射时不停放本振", not ctrl.status().get("tx_parked"),
+              f"parked={ctrl.status().get('tx_parked')}")
+        ctrl.stop_tracking()
+        _wait_for(ctrl, lambda s: bool(s.get("tx_parked")), timeout=2.0)
+        check("停止后自动停放本振", bool(ctrl.status().get("tx_parked")),
+              f"parked={ctrl.status().get('tx_parked')}")
+    finally:
+        ctrl.stop()
+        radio.close()
+
+
 def main() -> int:
     print("=" * 62)
-    print("干扰机自检（跟踪 / 感知 / 波形 / 闭环 / 中心搜索）")
+    print("干扰机自检（跟踪 / 感知 / 波形 / 闭环 / 模式 / 本振 / 时延 / 帧长 / 本振跳变 / 中心搜索）")
     print("=" * 62)
     test_tracker(); print("-" * 62)
     test_sensing(); print("-" * 62)
     test_waveform(); print("-" * 62)
     test_closed_loop(); print("-" * 62)
+    test_jam_modes(); print("-" * 62)
+    test_tx_lo_track(); print("-" * 62)
+    test_react_delay(); print("-" * 62)
+    test_long_frame(); print("-" * 62)
+    test_lo_hop(); print("-" * 62)
+    test_park_tx(); print("-" * 62)
     test_recovery(); print("-" * 62)
     test_center_scan()
 

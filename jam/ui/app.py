@@ -10,7 +10,7 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..agent.brain import JamAgent
-from ..config import WAVEFORM_NAMES, JamConfig
+from ..config import (POWER_MAX_DB, POWER_MIN_DB, WAVEFORM_NAMES, JamConfig)
 from ..controller import JamController
 
 BG = "#0b0f14"
@@ -128,6 +128,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._trend: deque = deque(maxlen=600)
         self._last_center = 0.0
         self._last_event_sig = None
+        self._last_jam_mode = None
 
         self.setWindowTitle("感知·跟踪·干扰控制台")
         self.resize(1560, 960)
@@ -150,7 +151,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         head = QtWidgets.QHBoxLayout()
         col = QtWidgets.QVBoxLayout()
-        title = QtWidgets.QLabel("应急频谱管控 · 跟踪干扰机")
+        title = QtWidgets.QLabel("红方 · 跟踪干扰机")
         title.setObjectName("Title")
         sub = QtWidgets.QLabel("3 GHz · 1.6 MHz 观测 · 10×160 kHz 信道 · 感知→锁定→跟随")
         sub.setObjectName("Subtitle")
@@ -326,11 +327,12 @@ class MainWindow(QtWidgets.QMainWindow):
         quick = QtWidgets.QGridLayout()
         quick.setSpacing(6)
         for i, (label, fn) in enumerate([
-            ("自动跟踪", lambda: self._cmd("start")),
+            ("响应式", lambda: self._cmd("start")),
             ("停止干扰", lambda: self._cmd("stop")),
             ("多音", lambda: self._cmd("mode", 1)),
             ("限带噪声", lambda: self._cmd("mode", 0)),
             ("功率 +5", lambda: self._cmd("power", 5)),
+            ("功率 -5", lambda: self._cmd("power", -5)),
             ("状态", lambda: self._cmd("status")),
             ("态势报告", lambda: self._cmd("situation")),
         ]):
@@ -345,6 +347,7 @@ class MainWindow(QtWidgets.QMainWindow):
         flabel.setStyleSheet(f"color:{MUTED};font-size:12px;")
         self.ch_combo = QtWidgets.QComboBox()
         self.ch_combo.addItems([str(i) for i in range(1, 11)])
+        self.ch_combo.setCurrentText("6")      # 默认 3.000000 GHz
         self.ch_combo.setStyleSheet(f"background:#0e141c;border:1px solid {BORDER};"
                                     f"border-radius:6px;padding:4px;color:{TEXT};")
         fbtn = QtWidgets.QPushButton("固定干扰")
@@ -352,7 +355,93 @@ class MainWindow(QtWidgets.QMainWindow):
         fixed_row.addWidget(flabel)
         fixed_row.addWidget(self.ch_combo, 1)
         fixed_row.addWidget(fbtn, 2)
+        self.fixed_row = fixed_row
         rlay.addLayout(fixed_row)
+
+        span_row = QtWidgets.QHBoxLayout()
+        span_row.setSpacing(6)
+        slabel = QtWidgets.QLabel("覆盖信道")
+        slabel.setStyleSheet(f"color:{MUTED};font-size:12px;")
+        self.span_spin = QtWidgets.QSpinBox()
+        self.span_spin.setRange(1, 10)
+        self.span_spin.setValue(1)
+        self.span_spin.setSuffix(" 个")
+        self.span_spin.setToolTip("从目标信道起，连续压住相邻的 N 个信道（带宽 = N×160 kHz）")
+        self.span_spin.setStyleSheet(f"background:#0e141c;border:1px solid {BORDER};"
+                                     f"border-radius:6px;padding:4px;color:{TEXT};")
+        self.span_spin.valueChanged.connect(self._span_changed)
+        self.span_hint = QtWidgets.QLabel("只压目标信道")
+        self.span_hint.setStyleSheet(f"color:{MUTED};font-size:11px;")
+        span_row.addWidget(slabel)
+        span_row.addWidget(self.span_spin, 1)
+        span_row.addWidget(self.span_hint, 2)
+        rlay.addLayout(span_row)
+
+        jamlen_row = QtWidgets.QHBoxLayout()
+        jamlen_row.setSpacing(6)
+        jlabel = QtWidgets.QLabel("干扰帧长")
+        jlabel.setStyleSheet(f"color:{MUTED};font-size:12px;")
+        self.jamlen_spin = QtWidgets.QDoubleSpinBox()
+        self.jamlen_spin.setRange(5.0, 2000.0)
+        self.jamlen_spin.setDecimals(0)
+        self.jamlen_spin.setSingleStep(50.0)
+        self.jamlen_spin.setValue(400.0)
+        self.jamlen_spin.setSuffix(" ms")
+        self.jamlen_spin.setToolTip("一帧压多久；越长占空比越高、看起来越连续，但跟踪越慢")
+        self.jamlen_spin.setStyleSheet(f"background:#0e141c;border:1px solid {BORDER};"
+                                       f"border-radius:6px;padding:4px;color:{TEXT};")
+        self.jamlen_spin.valueChanged.connect(self._jamlen_changed)
+        self.jamlen_hint = QtWidgets.QLabel("占空比 —")
+        self.jamlen_hint.setStyleSheet(f"color:{MUTED};font-size:11px;")
+        jamlen_row.addWidget(jlabel)
+        jamlen_row.addWidget(self.jamlen_spin, 1)
+        jamlen_row.addWidget(self.jamlen_hint, 2)
+        rlay.addLayout(jamlen_row)
+
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setSpacing(6)
+        mlabel = QtWidgets.QLabel("干扰模式")
+        mlabel.setStyleSheet(f"color:{MUTED};font-size:12px;")
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["固定干扰", "响应式干扰", "随机干扰"])
+        self.mode_combo.setStyleSheet(f"background:#0e141c;border:1px solid {BORDER};"
+                                      f"border-radius:6px;padding:4px;color:{TEXT};")
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        self.rand_spin = QtWidgets.QDoubleSpinBox()
+        self.rand_spin.setRange(0.5, 60.0)
+        self.rand_spin.setDecimals(1)
+        self.rand_spin.setSingleStep(0.5)
+        self.rand_spin.setValue(2.0)
+        self.rand_spin.setSuffix(" s")
+        self.rand_spin.setEnabled(False)
+        self.rand_spin.setStyleSheet(f"background:#0e141c;border:1px solid {BORDER};"
+                                     f"border-radius:6px;padding:4px;color:{TEXT};")
+        self.rand_spin.valueChanged.connect(self._rand_period_changed)
+        mode_row.addWidget(mlabel)
+        mode_row.addWidget(self.mode_combo, 1)
+        mode_row.addWidget(self.rand_spin, 1)
+        rlay.addLayout(mode_row)
+
+        react_row = QtWidgets.QHBoxLayout()
+        react_row.setSpacing(6)
+        rlabel = QtWidgets.QLabel("响应延迟")
+        rlabel.setStyleSheet(f"color:{MUTED};font-size:12px;")
+        self.react_spin = QtWidgets.QDoubleSpinBox()
+        self.react_spin.setRange(0.0, 3000.0)
+        self.react_spin.setDecimals(0)
+        self.react_spin.setSingleStep(50.0)
+        self.react_spin.setValue(0.0)
+        self.react_spin.setSuffix(" ms")
+        self.react_spin.setToolTip("判定切频后等多久才把干扰搬过去；0 = 立即跟随")
+        self.react_spin.setStyleSheet(f"background:#0e141c;border:1px solid {BORDER};"
+                                      f"border-radius:6px;padding:4px;color:{TEXT};")
+        self.react_spin.valueChanged.connect(self._react_changed)
+        self.react_hint = QtWidgets.QLabel("立即跟随")
+        self.react_hint.setStyleSheet(f"color:{MUTED};font-size:11px;")
+        react_row.addWidget(rlabel)
+        react_row.addWidget(self.react_spin, 1)
+        react_row.addWidget(self.react_hint, 2)
+        rlay.addLayout(react_row)
 
         center_row = QtWidgets.QHBoxLayout()
         center_row.setSpacing(6)
@@ -425,6 +514,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.send_btn.setEnabled(True)
         self._worker = None
 
+    MODE_ITEMS = ("fixed", "track", "random")
+
+    def _apply_mode(self, silent: bool = False):
+        idx = self.mode_combo.currentIndex()
+        mode = self.MODE_ITEMS[idx] if 0 <= idx < len(self.MODE_ITEMS) else "track"
+        if mode == "fixed":
+            ch = int(self.ch_combo.currentText())
+            self.ctrl.start_fixed(ch)
+            msg = f"固定干扰：锁死信道 {ch}，对方切频不跟随。"
+        elif mode == "random":
+            per = float(self.rand_spin.value())
+            self.ctrl.start_random(period_s=per)
+            msg = f"随机干扰：每 {per:.1f} 秒随机换信道/功率/带宽（不看对方动作）。"
+        else:
+            self.ctrl.start_tracking()
+            msg = "响应式干扰：锁定并跟随对方切频。"
+        if not silent:
+            self._append("系统", msg)
+
+    def _mode_changed(self, _idx: int):
+        self.rand_spin.setEnabled(self.mode_combo.currentIndex() == 2)
+        self._apply_mode()
+
+    def _rand_period_changed(self, _v):
+        if self.mode_combo.currentIndex() == 2:
+            self.ctrl.start_random(period_s=float(self.rand_spin.value()))
+
+    def _react_changed(self, v):
+        # 拖动/连点会连续触发，这里只下发命令，提示文字交给 _refresh
+        self.ctrl.set_params(react_delay_ms=float(v))
+
+    def _span_changed(self, v):
+        self.ctrl.set_params(span_channels=int(v))
+
+    def _jamlen_changed(self, v):
+        self.ctrl.set_params(jam_ms=float(v))
+
     def _fixed_jam(self):
         ch = int(self.ch_combo.currentText())
         self.ctrl.start_fixed(ch)
@@ -450,7 +576,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _cmd(self, kind: str, value=None):
         if kind == "start":
             self.ctrl.start_tracking()
-            self._append("系统", "已切换到自动跟踪。")
+            self._append("系统", "已切换到响应式干扰（锁定并跟随）。")
         elif kind == "stop":
             self.ctrl.stop_tracking()
             self._append("系统", "已停止跟踪与发射。")
@@ -459,7 +585,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append("系统", f"波形切换为 {WAVEFORM_NAMES.get(value)}。")
         elif kind == "power":
             cur = self.ctrl.status().get("power_db", 10.0)
-            new = min(20.0, max(0.0, cur + value))
+            new = min(POWER_MAX_DB, max(POWER_MIN_DB, cur + value))
             self.ctrl.set_params(power_db=new)
             self._append("系统", f"功率调整为 {new:.0f} dB。")
         elif kind == "situation":
@@ -480,8 +606,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not st.get("tracking", True):
             state_text = "已停止"
-        elif st.get("mode") == "fixed":
+        elif st.get("jam_mode") == "fixed":
             state_text = "固定"
+        elif st.get("jam_mode") == "random":
+            state_text = "随机"
         elif st.get("scanning"):
             state_text = "扫描"
         elif st.get("target_ch"):
@@ -493,7 +621,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self.v_state.setText(state_text)
         self.v_state.setStyleSheet(
             f"color:{RED if st.get('target_ch') else (MUTED if state_text == '已停止' else AMBER)};")
-        self.v_target.setText(f"信道 {st['target_ch']}" if st.get("target_ch") else "—")
+        target = st.get("target_ch")
+        jam_ch = st.get("jam_target_ch")
+        tx_mhz = st.get("tx_freq_mhz")
+        if target and jam_ch and jam_ch != target:
+            # 延迟窗口内：跟踪器已换目标，干扰还压在旧信道上
+            self.v_target.setText(f"跟踪 {target}｜仍压 {jam_ch}")
+        elif target and tx_mhz:
+            self.v_target.setText(f"信道 {target} · {tx_mhz:.4f} MHz")
+        else:
+            self.v_target.setText(f"信道 {target}" if target else "—")
+
+        # 反应延迟：值同步 + 剩余等待时间提示
+        delay_ms = float(st.get("react_delay_ms") or 0.0)
+        if not self.react_spin.hasFocus() and abs(self.react_spin.value() - delay_ms) > 0.5:
+            self.react_spin.blockSignals(True)
+            self.react_spin.setValue(delay_ms)
+            self.react_spin.blockSignals(False)
+        pend = st.get("react_pending_ms")
+        if delay_ms <= 0:
+            hint = "立即跟随"
+        elif not st.get("react_active"):
+            hint = f"延迟 {delay_ms:.0f} ms（仅响应式生效）"
+        elif pend is not None:
+            hint = f"延迟 {delay_ms:.0f} ms ｜ 等待中 {pend:.0f} ms"
+        elif st.get("last_react_ms") is not None:
+            hint = f"延迟 {delay_ms:.0f} ms ｜ 上次实延 {st['last_react_ms']:.0f} ms"
+        else:
+            hint = f"延迟 {delay_ms:.0f} ms"
+        self.react_hint.setText(hint)
+
+        # 覆盖信道数
+        span = int(st.get("span_channels") or 1)
+        if not self.span_spin.hasFocus() and self.span_spin.value() != span:
+            self.span_spin.blockSignals(True)
+            self.span_spin.setValue(span)
+            self.span_spin.blockSignals(False)
+        if span <= 1:
+            self.span_hint.setText("只压目标信道")
+        else:
+            lo = st.get("jam_target_ch") or st.get("target_ch")
+            hi = st.get("span_to_ch")
+            bw = float(st.get("bw_khz") or 0)
+            self.span_hint.setText(
+                f"{lo}-{hi} 号连续 {span} 个 · {bw:.0f} kHz" if lo
+                else f"连续 {span} 个 · {bw:.0f} kHz")
+
+        # 干扰帧长 / 占空比
+        jam_ms = float(st.get("jam_on_ms") or 0.0)
+        if not self.jamlen_spin.hasFocus() and abs(self.jamlen_spin.value() - jam_ms) > 0.5:
+            self.jamlen_spin.blockSignals(True)
+            self.jamlen_spin.setValue(jam_ms)
+            self.jamlen_spin.blockSignals(False)
+        cyc = float(st.get("cycle_ms") or 0.0)
+        self.jamlen_hint.setText(
+            f"占空比 {st.get('duty_pct', 0):.0f}% · 周期 {cyc:.0f} ms" if cyc
+            else f"{jam_ms:.0f} ms")
         self.v_hop.setText(str(st.get("hop_count", 0)))
         self.v_center.setText(f"{st.get('center_mhz', 0):.3f} MHz")
         von = bool(st.get("victim_on", False))
@@ -510,6 +693,28 @@ class MainWindow(QtWidgets.QMainWindow):
         wave = WAVEFORM_NAMES.get(st.get("waveform", 0), "-")
         self.v_param.setText(f"{st.get('power_db', 0):.0f} dB · {st.get('bw_khz', 0):.0f} kHz · {wave}")
         self.v_cycle.setText(f"{st.get('cycle_ms', 0):.1f} ms")
+
+        # 干扰模式下拉与随机周期，跟随后端状态（阻塞信号，避免回环触发）
+        jm = st.get("jam_mode", "track")
+        want = {"fixed": 0, "track": 1, "random": 2}.get(jm, 1)
+        if self.mode_combo.currentIndex() != want:
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(want)
+            self.mode_combo.blockSignals(False)
+        self.rand_spin.setEnabled(jm == "random")
+        # 只在模式刚变化时对齐一次信道下拉，避免周期性覆盖操作员刚选的信道
+        if jm != self._last_jam_mode:
+            if jm == "fixed" and st.get("target_ch"):
+                self.ch_combo.blockSignals(True)
+                self.ch_combo.setCurrentText(str(int(st["target_ch"])))
+                self.ch_combo.blockSignals(False)
+            self._last_jam_mode = jm
+        if not self.rand_spin.hasFocus():
+            per = float(st.get("random_period_s") or 2.0)
+            if abs(self.rand_spin.value() - per) > 0.05:
+                self.rand_spin.blockSignals(True)
+                self.rand_spin.setValue(per)
+                self.rand_spin.blockSignals(False)
 
         freqs = st.get("freqs_ghz") or []
         spec = st.get("spectrum") or []
@@ -534,7 +739,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scores = st.get("scores") or []
         if len(scores) == 10:
             target = st.get("target_ch")
-            jam_on = bool(target) and float(st.get("power_db", 0) or 0) > 0
+            jam_on = bool(target)      # 负功率也是在发射，只是更弱
             # 干扰带：中心（0~10 的信道坐标）、宽度（信道数）+ 视觉外扩
             band = ((float(target) - 0.5,
                      float(st.get("bw_khz", 160) or 160) / 160.0,
@@ -627,7 +832,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.cfg.centers_at(center)[ch - 1] / 1e9
 
     def _add_log(self, ev: dict):
-        names = {"acquired": "锁定", "hop": "跟随", "lost": "释放"}
+        names = {"acquired": "锁定", "hop": "跟随", "lost": "释放", "random": "随机"}
         row = self.log.rowCount()
         self.log.insertRow(row)
         vals = [time.strftime("%H:%M:%S"), names.get(ev.get("kind"), ev.get("kind")),

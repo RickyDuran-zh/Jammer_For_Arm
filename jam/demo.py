@@ -1,4 +1,4 @@
-"""演示入口：默认实机（子板2 发模拟信号），--mock 为无硬件演示。"""
+﻿"""演示入口：默认实机（子板2 发模拟信号），--mock 为无硬件演示。"""
 from __future__ import annotations
 
 import random
@@ -6,8 +6,9 @@ import time
 from dataclasses import replace
 
 from .agent.brain import JamAgent
-from .config import JamConfig
+from .config import JAM_MODE_NAMES, JamConfig
 from .controller import JamController
+from .logger import attach as attach_logger
 from .radio.dual import MockDualRadio, make_radio
 
 
@@ -17,6 +18,8 @@ def _print_event(ev) -> None:
     elif ev.kind == "hop":
         print(f"  [跟随] frame={ev.frame} 信道{ev.prev_channel} → 信道{ev.channel} "
               f"score={ev.score:.2f}")
+    elif ev.kind == "random":
+        print(f"  [随机] frame={ev.frame} → 信道{ev.channel} {ev.detail}")
     elif ev.kind == "lost":
         print(f"  [释放] frame={ev.frame} 原信道{ev.prev_channel}")
 
@@ -38,8 +41,15 @@ def victim_plan(cfg: JamConfig, seed: int | None = None) -> list[tuple[float, fl
     return plan
 
 
-def _build(mock: bool, no_tx: bool, center_mhz: float, victim: bool):
-    cfg = replace(JamConfig(), center_freq_hz=center_mhz * 1e6)
+def _build(mock: bool, no_tx: bool, center_mhz: float, victim: bool,
+           tx_gain_db: float = 0.0, tx_lo_track: bool = True,
+           span_channels: int = 1, park_tx: bool = True):
+    cfg = replace(JamConfig(), center_freq_hz=center_mhz * 1e6,
+                  tx_lo_track=bool(tx_lo_track),
+                  span_channels=max(1, int(span_channels)),
+                  park_tx_when_idle=bool(park_tx))
+    if tx_gain_db is not None:      # None = 用配置默认值
+        cfg = replace(cfg, tx_gain_fixed=float(tx_gain_db))
     plan = victim_plan(cfg)
     if mock:
         radio = MockDualRadio(cfg, hop_plan=plan,
@@ -53,25 +63,34 @@ def _build(mock: bool, no_tx: bool, center_mhz: float, victim: bool):
 
 def run_ui(mock: bool = False, no_tx: bool = False,
            center_mhz: float = 3000.0, fixed_ch: int | None = None,
-           victim: bool | None = None) -> int:
+           victim: bool | None = None, params: dict | None = None,
+           log_path: str | None = None, case: str = "",
+           tx_gain_db: float | None = None, jam_mode: str = "track",
+           random_period: float = 2.0, tx_lo_track: bool = True,
+           span_channels: int = 1, park_tx: bool = True) -> int:
     from PyQt5 import QtWidgets
     from .ui.app import MainWindow
 
     if victim is None:
         victim = mock          # 实机默认不开模拟信号
-    cfg, radio, plan = _build(mock, no_tx, center_mhz, victim)
+    cfg, radio, plan = _build(mock, no_tx, center_mhz, victim, tx_gain_db,
+                                  tx_lo_track, span_channels, park_tx)
     ctrl = JamController(cfg, radio, on_event=_print_event, victim_plan=plan)
     ctrl.start()
     if victim:
         ctrl.set_victim(True)
-    if fixed_ch:
-        ctrl.start_fixed(fixed_ch)
+    _apply_startup_mode(ctrl, jam_mode, fixed_ch, random_period)
+    if params:
+        ctrl.set_params(**params)
+    log = attach_logger(ctrl, log_path, case) if log_path else None
 
     print("=" * 64)
     print(f"干扰机启动 | {'模拟后端' if mock else 'USRP X310'}"
           f" | 子板1: RX2 感知 + TX/RX 干扰"
           f" | 子板2: {'模拟信号（随机跳频）' if victim else '关闭'}"
-          f" | 中心 {center_mhz:.3f} MHz")
+          f" | 中心 {center_mhz:.3f} MHz"
+          f" | 模式 {JAM_MODE_NAMES.get(jam_mode, jam_mode)}"
+          + (f"（周期 {random_period:.1f} s）" if jam_mode == "random" else ""))
     print("界面窗口已打开，关掉窗口即退出。")
     print("=" * 64, flush=True)
 
@@ -84,26 +103,48 @@ def run_ui(mock: bool = False, no_tx: bool = False,
         return app.exec_()
     finally:
         ctrl.stop()
+        if log is not None:
+            log.stop()
         radio.close()
+
+
+def _apply_startup_mode(ctrl: JamController, jam_mode: str,
+                        fixed_ch: int | None, random_period: float = 2.0) -> None:
+    """按命令行选定的干扰模式启动。"""
+    if jam_mode == "random":
+        ctrl.start_random(period_s=random_period)
+    elif jam_mode == "fixed" or fixed_ch:
+        ctrl.start_fixed(fixed_ch or 6)
 
 
 def run_console(mock: bool = False, no_tx: bool = False,
                 seconds: float = 10.0, center_mhz: float = 3000.0,
                 chat: bool = False, fixed_ch: int | None = None,
-                victim: bool | None = None) -> None:
+                victim: bool | None = None, params: dict | None = None,
+                log_path: str | None = None, case: str = "",
+                tx_gain_db: float | None = None, jam_mode: str = "track",
+                random_period: float = 2.0, tx_lo_track: bool = True,
+                span_channels: int = 1, park_tx: bool = True) -> None:
     if victim is None:
         victim = mock
-    cfg, radio, plan = _build(mock, no_tx, center_mhz, victim)
+    cfg, radio, plan = _build(mock, no_tx, center_mhz, victim, tx_gain_db,
+                                  tx_lo_track, span_channels, park_tx)
     ctrl = JamController(cfg, radio, on_event=_print_event, victim_plan=plan)
     ctrl.start()
     if victim:
         ctrl.set_victim(True)
-    if fixed_ch:
-        ctrl.start_fixed(fixed_ch)
+    _apply_startup_mode(ctrl, jam_mode, fixed_ch, random_period)
+    if params:
+        ctrl.set_params(**params)
+    log = attach_logger(ctrl, log_path, case) if log_path else None
 
     print(f"干扰机启动 | 中心 {center_mhz:.3f} MHz | "
           f"{'只感知' if no_tx else '感知+干扰'} | "
-          f"模拟信号{'开' if victim else '关'} | 按 Ctrl+C 结束")
+          f"模拟信号{'开' if victim else '关'} | TX增益 {cfg.tx_gain_fixed:+.1f} dB | "
+          f"覆盖 {cfg.span_channels} 信道 | "
+          f"模式 {JAM_MODE_NAMES.get(jam_mode, jam_mode)}"
+          + (f"({random_period:.1f}s)" if jam_mode == "random" else "")
+          + " | 按 Ctrl+C 结束")
 
     try:
         if chat:
@@ -126,4 +167,6 @@ def run_console(mock: bool = False, no_tx: bool = False,
         pass
     finally:
         ctrl.stop()
+        if log is not None:
+            log.stop()
         radio.close()

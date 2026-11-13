@@ -5,14 +5,21 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 
 import numpy as np
 
-from .config import WAVEFORM_NAMES, Action, JamConfig
+from .config import (JAM_MODE_NAMES, POWER_MAX_DB, POWER_MIN_DB, WAVEFORM_NAMES,
+                     Action, JamConfig, JamMode, RandomPolicy)
 from .dsp.sensing import SensingResult, covered_channels, sense, suppress_center_dc
 from .dsp.waveform import generate
 from .radio.dual import DualRadio
 from .tracking.tracker import Event, Tracker, TrackerPolicy
+
+
+def _clamp_power(value: float) -> float:
+    """功率统一在入口处截断，避免状态里报出一个实际没用上的数值。"""
+    return min(POWER_MAX_DB, max(POWER_MIN_DB, float(value)))
 
 
 class JamController:
@@ -45,6 +52,24 @@ class JamController:
         self._rng = np.random.default_rng(2026)
         self._auto_track = True
         self._hold = False
+        self._jam_mode = JamMode.TRACK
+        self._random = RandomPolicy()
+        self._next_roll_at = 0.0
+        self._last_roll: dict = {}
+        self._tx_freq_hz = 0.0
+        self._eff_bw_khz = float(self._action.bw_khz)
+        self._eff_span = 1
+        self._span_channels = max(1, min(int(cfg.span_channels), cfg.num_channels))
+        self._jam_on_s = max(0.002, float(cfg.jam_on_s))
+        self._duty_pct = 0.0
+        self._lo_hop = bool(cfg.lo_hop)
+        self._tx_parked = False
+        # 反应延迟：跟踪器判定的目标与实际施扰目标之间可控的滞后
+        self._react_delay_s = max(0.0, float(cfg.react_delay_s))
+        self._jam_target: int | None = None
+        self._react_pending: int | None = None
+        self._react_detect_at = 0.0
+        self.last_react_ms: float | None = None
         self._scanning = False
         self._next_scan_frame = cfg.scan_interval_frames
         self.last_hop_latency_ms: float | None = None
@@ -98,6 +123,18 @@ class JamController:
         self.start_tracking(channel=channel, waveform_mode=waveform_mode,
                             power_db=power_db, bw_khz=bw_khz, hold=True)
 
+    def start_random(self, period_s: float | None = None,
+                     channels=None,
+                     power_min_db: float | None = None,
+                     power_max_db: float | None = None,
+                     bw_choices_khz=None,
+                     waveform_mode: int | None = None) -> None:
+        """随机干扰：按周期随机改目标信道/功率/带宽，不参考对方通信行为。"""
+        self._submit("random", dict(
+            period_s=period_s, channels=channels,
+            power_min_db=power_min_db, power_max_db=power_max_db,
+            bw_choices_khz=bw_choices_khz, waveform_mode=waveform_mode))
+
     def set_center(self, freq_hz: float) -> None:
         """切换中心频率：重调 ch0 收/发，清空目标后重新搜索。"""
         self._submit("center", {"freq_hz": float(freq_hz)})
@@ -110,9 +147,16 @@ class JamController:
         self._submit("stop", {})
 
     def set_params(self, waveform_mode: int | None = None, power_db: float | None = None,
-                   bw_khz: float | None = None) -> None:
+                   bw_khz: float | None = None,
+                   react_delay_ms: float | None = None,
+                   span_channels: int | None = None,
+                   jam_ms: float | None = None,
+                   lo_hop: bool | None = None) -> None:
         self._submit("params", dict(waveform_mode=waveform_mode,
-                                    power_db=power_db, bw_khz=bw_khz))
+                                    power_db=power_db, bw_khz=bw_khz,
+                                    react_delay_ms=react_delay_ms,
+                                    span_channels=span_channels,
+                                    jam_ms=jam_ms, lo_hop=lo_hop))
 
     def _submit(self, cmd: str, payload: dict, timeout: float = 2.0) -> bool:
         ack = threading.Event()
@@ -133,10 +177,11 @@ class JamController:
             if cmd == "track":
                 self._auto_track = True
                 self._hold = bool(p.get("hold", False))
+                self._jam_mode = JamMode.FIXED if self._hold else JamMode.TRACK
                 if p.get("waveform_mode") is not None:
                     self._action.waveform_mode = int(p["waveform_mode"])
                 if p.get("power_db") is not None:
-                    self._action.power_db = float(p["power_db"])
+                    self._action.power_db = _clamp_power(p["power_db"])
                 if p.get("bw_khz") is not None:
                     self._action.bw_khz = float(p["bw_khz"])
                 ch = p.get("channel")
@@ -147,12 +192,14 @@ class JamController:
             elif cmd == "stop":
                 self._auto_track = False
                 self._hold = False
+                self._jam_mode = JamMode.TRACK
                 ev = self.tracker.force_target(None, "manual-stop")
                 self._emit(ev)
                 self._prev_action = None
             elif cmd == "center":
                 self._auto_track = True
                 self._hold = False
+                self._jam_mode = JamMode.TRACK
                 ev = self.tracker.force_target(None, "center-change")
                 self._emit(ev)
                 self._prev_action = None
@@ -160,6 +207,7 @@ class JamController:
                 try:
                     self.radio.set_center(float(p["freq_hz"]))
                     self._center_hz = float(p["freq_hz"])
+                    self._tx_freq_hz = float(p["freq_hz"])   # 换中心时 TX 也被同步调走
                 except Exception as exc:
                     self._publish(error=f"center: {exc}")
                 self._next_scan_frame = self.frames
@@ -183,18 +231,143 @@ class JamController:
                 if p.get("waveform_mode") is not None:
                     self._action.waveform_mode = int(p["waveform_mode"])
                 if p.get("power_db") is not None:
-                    self._action.power_db = float(p["power_db"])
+                    self._action.power_db = _clamp_power(p["power_db"])
                 if p.get("bw_khz") is not None:
                     self._action.bw_khz = float(p["bw_khz"])
+                if p.get("react_delay_ms") is not None:
+                    self._react_delay_s = max(0.0, float(p["react_delay_ms"]) / 1e3)
+                    self._react_pending = None    # 改了延迟，重新计时
+                if p.get("span_channels") is not None:
+                    self._span_channels = max(1, min(int(p["span_channels"]),
+                                                     self.cfg.num_channels))
+                    self._sync_prev_action()
+                if p.get("jam_ms") is not None:
+                    self._jam_on_s = min(max(float(p["jam_ms"]) / 1e3, 0.002), 5.0)
+                if p.get("lo_hop") is not None:
+                    self._lo_hop = bool(p["lo_hop"])
+            elif cmd == "random":
+                self._auto_track = True
+                self._hold = True          # 随机模式不经过跟踪器判决
+                self._jam_mode = JamMode.RANDOM
+                self._apply_random_policy(p)
+                if p.get("waveform_mode") is not None:
+                    self._action.waveform_mode = int(p["waveform_mode"])
+                self._next_roll_at = 0.0   # 立即抽第一次，避免"模式已变、参数未变"的空窗
+                self._roll_random()
             self._publish()
             ack.set()
+
+    # ── 干扰模式：随机 ────────────────────────────────────────
+    def _apply_random_policy(self, p: dict) -> None:
+        kw = {}
+        if p.get("period_s") is not None:
+            kw["period_s"] = max(0.2, float(p["period_s"]))
+        if p.get("power_min_db") is not None:
+            kw["power_min_db"] = float(p["power_min_db"])
+        if p.get("power_max_db") is not None:
+            kw["power_max_db"] = float(p["power_max_db"])
+        if p.get("bw_choices_khz"):
+            kw["bw_choices_khz"] = tuple(float(b) for b in p["bw_choices_khz"])
+        if p.get("channels"):
+            chans = sorted({min(max(int(c), 1), self.cfg.num_channels)
+                            for c in p["channels"]})
+            if chans:
+                kw["channels"] = tuple(chans)
+        pol = replace(self._random, **kw)
+        if pol.power_min_db > pol.power_max_db:
+            pol = replace(pol, power_min_db=pol.power_max_db,
+                          power_max_db=pol.power_min_db)
+        self._random = pol
+
+    def _roll_random(self) -> None:
+        """抽一组新参数并立即生效（不参考感知结果）。"""
+        pol = self._random
+        prev = self.tracker.target
+        channel = self._pick_random_channel(prev)
+
+        power = self._action.power_db
+        if pol.vary_power:
+            power = float(self._rng.uniform(pol.power_min_db, pol.power_max_db))
+        bw = self._action.bw_khz
+        if pol.vary_bw and pol.bw_choices_khz:
+            bw = float(self._rng.choice(pol.bw_choices_khz))
+
+        self._action.power_db = round(_clamp_power(power), 1)
+        self._action.bw_khz = float(bw)
+        ev = self.tracker.force_target(channel - 1, "random")
+        if ev is not None:
+            ev.kind = "random"          # 与"跟随"区分开：这是本地抽的，不是感知到的
+            ev.detail = f"{power:.0f} dB / {bw:.0f} kHz"
+        self._emit(ev)
+        self._sync_prev_action()
+        self._next_roll_at = time.monotonic() + max(0.2, float(pol.period_s))
+        self._last_roll = {
+            "channel": int(channel),
+            "power_db": round(float(power), 1),
+            "bw_khz": round(float(bw), 0),
+            "at": round(time.time(), 3),
+        }
+
+    def _pick_random_channel(self, prev: int | None) -> int:
+        pol = self._random
+        chans = list(pol.channels) or list(range(1, self.cfg.num_channels + 1))
+        if pol.avoid_repeat and prev is not None and len(chans) > 1:
+            prev_ch = prev + 1
+            filtered = [c for c in chans if c != prev_ch]
+            if filtered:
+                chans = filtered
+        return int(self._rng.choice(chans))
+
+    # ── 反应延迟 ──────────────────────────────────────────────
+    # ── 覆盖块 ────────────────────────────────────────────────
+    def _make_action(self, target: int) -> Action:
+        """把目标信道展开成一个"干扰块"：N 个相邻信道 → 带宽 N×160 kHz，
+        中心落在块中点（偏移 (N-1)×80 kHz），这样块边界正好对齐信道边界。"""
+        cfg = self.cfg
+        ch_w = cfg.channel_width_hz
+        if self._jam_mode is JamMode.RANDOM:
+            span = 1                      # 随机模式有自己的带宽策略
+        else:
+            span = min(max(int(self._span_channels), 1), cfg.num_channels - target)
+        bw_khz = span * ch_w / 1e3 if span > 1 else float(self._action.bw_khz)
+        offset = (span - 1) * ch_w / 2.0
+        return Action(target, self._action.power_db, bw_khz,
+                      self._action.waveform_mode, offset)
+
+    def _tx_freq_for(self, act: Action) -> float:
+        return float(self.cfg.centers_at(self._center_hz)[act.channel_idx]
+                     + act.center_offset_hz)
+
+    def _update_jam_target(self) -> None:
+        """把"跟踪器判定"和"真正把干扰搬过去"分开，中间插入可调延迟。
+
+        延迟期间继续压旧信道（不空着），所以对方会看到"先被压住、过一会儿才被跟上"，
+        正好用来测"感知→施扰"这段时延。
+        """
+        tgt = self.tracker.target
+        if self._jam_mode is not JamMode.TRACK or self._react_delay_s <= 0.0:
+            self._jam_target = tgt
+            self._react_pending = None
+            return
+
+        now = time.monotonic()
+        if tgt == self._jam_target:
+            self._react_pending = None
+            return
+        if self._react_pending != tgt:          # 又变了一次，重新计时
+            self._react_pending = tgt
+            self._react_detect_at = now
+        waited = now - self._react_detect_at
+        if waited >= self._react_delay_s:
+            self._jam_target = tgt
+            self.last_react_ms = round(waited * 1e3, 1)
+            self._react_pending = None
 
     def _sync_prev_action(self) -> None:
         if self.tracker.target is None:
             self._prev_action = None
             return
-        self._prev_action = Action(self.tracker.target, self._action.power_db,
-                                   self._action.bw_khz, self._action.waveform_mode)
+        self._prev_action = self._make_action(self.tracker.target)
 
     def _loop(self) -> None:
         cfg = self.cfg
@@ -210,6 +383,11 @@ class JamController:
         if True:
             t0 = time.perf_counter()
             self._drain_commands()
+
+            # 随机干扰：到点就换一组参数，完全由本地时钟驱动
+            if self._jam_mode is JamMode.RANDOM and self._auto_track:
+                if time.monotonic() >= self._next_roll_at:
+                    self._roll_random()
 
             if (self._auto_track and self.tracker.target is None
                     and not self._scanning and self.frames >= self._next_scan_frame
@@ -268,24 +446,59 @@ class JamController:
                                                if ev.prev_channel else None)
                     self._next_scan_frame = self.frames + 2
 
-            target = self.tracker.target
+            self._update_jam_target()
+
+            target = self._jam_target
             if target is not None:
-                act = Action(target, self._action.power_db, self._action.bw_khz,
-                             self._action.waveform_mode)
-                wave, gain = generate(act, cfg, cfg.jam_block_samples, self._rng,
-                                      center_hz=self._center_hz)
+                act = self._make_action(target)
+                # TX 跟踪模式：本振直接调到该信道，基带打 DC；否则基带搬移
+                # lo_hop 也要求本振落在信道上，所以同样走 DC 基带
+                track_lo = cfg.tx_lo_track or self._lo_hop
+                tx_freq = (self._tx_freq_for(act) if track_lo else None)
+                # 长帧不要重复同一小段（会在频谱上留等间隔梳状线），
+                # 生成帧长的 1/8（最长 25.6 万点），其余靠平铺，梳齿间隔已低到看不见
+                need = int(self._jam_on_s * cfg.sense_rate)
+                gen_len = int(min(max(need // 8, 4096), 262144))
+                wave, gain = generate(act, cfg, gen_len, self._rng,
+                                      center_hz=self._center_hz,
+                                      baseband_offset_hz=0.0 if tx_freq is not None else None)
+                self._eff_bw_khz = act.bw_khz
+                self._eff_span = int(round(act.bw_khz * 1e3 / cfg.channel_width_hz))
+                hop = bool(self._lo_hop and self.radio.supports_lo_hop)
                 try:
-                    self.radio.jam(wave, gain, cfg.jam_on_s)
+                    if hop:
+                        # 共用本振：整块搬到目标信道，基带就在 DC
+                        self.radio.set_center(float(tx_freq))
+                    self.radio.jam(wave, gain, self._jam_on_s, tx_freq_hz=tx_freq)
                     self.tx_frames += 1
+                    self._tx_parked = False
+                    if tx_freq is not None:
+                        # 记实测值：UHD 调谐可能留几 kHz 残差，报告要能对上频谱仪
+                        actual = self.radio.tx_freq()
+                        self._tx_freq_hz = float(actual) if actual else tx_freq
                 except Exception as exc:
                     self._publish(error=f"tx: {exc}")
+                finally:
+                    if hop:
+                        # 发完立刻搬回感知中心：否则 3.000000 上会常驻一根本振泄漏
+                        try:
+                            self.radio.set_center(self._center_hz)
+                            self.radio.flush_rx()
+                        except Exception as exc:
+                            self._publish(error=f"lo-hop: {exc}")
                 self._prev_action = act
                 self._update_wave_preview(wave, act)
             else:
                 self._prev_action = None
                 self._wave_preview = None
                 self._wave_meta = "未发射"
-                time.sleep(cfg.jam_on_s)
+                # 待机时把 TX 本振挪出观测频段，否则泄漏谱线正好压在 3 GHz 上
+                if not self._tx_parked:
+                    try:
+                        self._tx_parked = bool(self.radio.park_tx())
+                    except Exception:
+                        self._tx_parked = False
+                time.sleep(min(self._jam_on_s, 0.02))   # 没目标时快速轮询感知
 
             time.sleep(cfg.sense_gap_s)
             try:
@@ -294,6 +507,9 @@ class JamController:
                 pass
 
             self.last_cycle_ms = (time.perf_counter() - t0) * 1e3
+            if self.last_cycle_ms > 0 and self.tx_frames:
+                self._duty_pct = min(100.0,
+                                     self._jam_on_s * 1e3 / self.last_cycle_ms * 100.0)
             self._publish()
 
     # ── 历史与自恢复 ──────────────────────────────────────────
@@ -321,6 +537,12 @@ class JamController:
             "uptime_s": round(time.time() - self._started_at, 1),
             "tx_frames": st.get("tx_frames", 0),
             "mode": st.get("mode", "-"),
+            "jam_mode": st.get("jam_mode", "-"),
+            "jam_mode_name": st.get("jam_mode_name", "-"),
+            "random_policy": st.get("random_policy", "-"),
+            "tx_lo_track": st.get("tx_lo_track"),
+            "tx_freq_mhz": st.get("tx_freq_mhz"),
+            "react_delay_ms": st.get("react_delay_ms"),
         }
 
     def _recover_radio(self) -> None:
@@ -423,8 +645,28 @@ class JamController:
             "hold": self._hold,
             "scanning": self._scanning,
             "state": t.state.value,
-            "mode": ("fixed" if self._hold else
-                     ("auto" if self._auto_track else "stopped")),
+            "jam_mode": self._jam_mode.value,
+            "jam_mode_name": JAM_MODE_NAMES.get(self._jam_mode.value, "-"),
+            "mode": ("stopped" if not self._auto_track
+                     else self._jam_mode.value if self._jam_mode is not JamMode.TRACK
+                     else "auto"),
+            "random_period_s": round(float(self._random.period_s), 2),
+            "random_next_s": (round(max(0.0, self._next_roll_at - time.monotonic()), 1)
+                              if self._jam_mode is JamMode.RANDOM and self._auto_track
+                              else None),
+            "random_last": dict(self._last_roll),
+            "random_policy": self._random.described(),
+            "react_delay_ms": round(self._react_delay_s * 1e3, 1),
+            "react_active": (self._jam_mode is JamMode.TRACK
+                             and self._react_delay_s > 0),
+            "react_pending_ms": (
+                round(max(0.0, self._react_delay_s
+                          - (time.monotonic() - self._react_detect_at)) * 1e3, 1)
+                if (self._react_pending is not None and self._react_delay_s > 0)
+                else None),
+            "last_react_ms": self.last_react_ms,
+            "jam_target_ch": ((self._jam_target + 1)
+                              if self._jam_target is not None else None),
             "victim_on": self._victim_on,
             "hop_latency_ms": self.last_hop_latency_ms,
             "noise_ref": round(self._noise_ref, 12) if self._noise_ref else 0.0,
@@ -436,10 +678,26 @@ class JamController:
             "frames": self.frames,
             "tx_frames": self.tx_frames,
             "cycle_ms": round(self.last_cycle_ms, 2),
+            "jam_on_ms": round(self._jam_on_s * 1e3, 1),
+            "duty_pct": round(self._duty_pct, 1),
             "center_mhz": round(self._center_hz / 1e6, 4),
+            "tx_freq_mhz": round(self._tx_freq_hz / 1e6, 5) if self._tx_freq_hz else None,
+            "tx_lo_track": bool(self.cfg.tx_lo_track),
+            "lo_hop": bool(self._lo_hop),
+            "lo_independent": getattr(self.radio, "lo_independent", None),
+            "tx_parked": bool(self._tx_parked),
+            "tx_tune_ms": round(float(getattr(self.radio, "last_tune_ms", 0.0)), 2),
+            "tx_err_hz": (round(self._tx_freq_hz - self._tx_freq_for(
+                self._make_action(t.target)), 1)
+                if (self.cfg.tx_lo_track and t.target is not None
+                    and self._tx_freq_hz) else None),
             "waveform": self._action.waveform_mode,
             "power_db": self._action.power_db,
-            "bw_khz": self._action.bw_khz,
+            "bw_khz": round(self._eff_bw_khz, 1),
+            "bw_set_khz": self._action.bw_khz,
+            "span_channels": self._eff_span,
+            "span_to_ch": (min(10, (self._jam_target or 0) + self._eff_span)
+                           if self._jam_target is not None else None),
             "scores": [round(float(v), 3) for v in (res.score if res else [])],
             "jam_cov": self._jam_coverage(),
             "channel_map": [int(v) for v in (res.channel_map if res else [])],

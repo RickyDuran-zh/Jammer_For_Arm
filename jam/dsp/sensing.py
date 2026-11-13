@@ -51,7 +51,7 @@ def suppress_center_dc(x: np.ndarray, cfg: JamConfig) -> np.ndarray:
 def _affected_channels(action: Action, cfg: JamConfig, center_hz: float) -> list[int]:
     centers = cfg.centers_at(center_hz)
     bw_hz = float(action.bw_khz) * 1e3
-    center = centers[action.channel_idx]
+    center = centers[action.channel_idx] + float(action.center_offset_hz)
     left, right = center - bw_hz / 2, center + bw_hz / 2
     out = []
     for k in range(cfg.num_channels):

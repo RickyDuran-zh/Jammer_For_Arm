@@ -23,13 +23,18 @@ from ..config import JamConfig
 
 class DualRadio(ABC):
     center_hz: float
+    supports_lo_hop: bool = False
+    lo_independent: bool | None = None   # None=未知，True=独立，False=共用
+    tx_parked: bool = False
 
     @abstractmethod
     def sense_frame(self) -> np.ndarray:
         ...
 
     @abstractmethod
-    def jam(self, samples: np.ndarray, gain_db: float, duration_s: float) -> None:
+    def jam(self, samples: np.ndarray, gain_db: float, duration_s: float,
+            tx_freq_hz: float | None = None) -> None:
+        """tx_freq_hz 非空时，先把 TX 本振调到该频率再发（基带对 DC）。"""
         ...
 
     def start_victim(self, plan, amp: float = 0.05) -> None:
@@ -40,6 +45,14 @@ class DualRadio(ABC):
 
     def set_center(self, freq_hz: float) -> None:
         self.center_hz = freq_hz
+
+    def tx_freq(self) -> float | None:
+        """当前 TX 实际频率（Hz）；还没发过返回 None。"""
+        return getattr(self, "tx_freq_hz", None)
+
+    def park_tx(self) -> bool:
+        """空闲时把 TX 本振挪出观测频段（默认实现什么都不做）。"""
+        return False
 
     def flush_rx(self) -> None:
         ...
@@ -76,6 +89,8 @@ class MockDualRadio(DualRadio):
         self.jam_cycles = 0
         self.last_jam_channel: int | None = None
         self.tx_enabled = True
+        self.tx_freq_hz: float | None = None
+        self.last_tune_ms = 0.0
         self.center_history: list[float] = []
 
     def _apply_schedule(self) -> None:
@@ -122,12 +137,17 @@ class MockDualRadio(DualRadio):
                     x += 0.18 * np.exp(1j * 2 * np.pi * second * self.t)
         return x
 
-    def jam(self, samples: np.ndarray, gain_db: float, duration_s: float) -> None:
+    def jam(self, samples: np.ndarray, gain_db: float, duration_s: float,
+            tx_freq_hz: float | None = None) -> None:
         self.jam_cycles += 1
+        if tx_freq_hz is not None:
+            self.tx_freq_hz = float(tx_freq_hz)
         time.sleep(duration_s)
 
 
 class UhdDualRadio(DualRadio):
+    supports_lo_hop = True
+
     def __init__(self, cfg: JamConfig, args: str | None = None,
                  tx_enabled: bool = True, rx_thread: bool = False):
         import uhd
@@ -139,6 +159,10 @@ class UhdDualRadio(DualRadio):
         self.overflow = 0
         self._tx_end_time = 0.0
         self.center_hz = cfg.center_freq_hz
+        self._tx_freq = float(cfg.center_freq_hz)
+        self.lo_independent = None
+        self.tx_parked = False
+        self._tx_gain_now = float(cfg.tx_gain_fixed)
         self._reader = None
         self._vtx = None
         self.victim_last_hop_s = None
@@ -167,6 +191,50 @@ class UhdDualRadio(DualRadio):
 
         for mb in range(self.usrp.get_num_mboards()):
             self.usrp.set_clock_source("internal", mb)
+
+        # 先确认两个本振是否独立，再决定待机时能不能把 TX 挪走
+        self._probe_lo_independence()
+        if self.lo_independent:
+            self.park_tx()
+
+    def _probe_lo_independence(self) -> bool | None:
+        """把 TX 振到 20 MHz 外，看 RX 是否跟着动。
+
+        不动 → RX/TX 各自独立（可以挪 TX、可以跟踪）；
+        跟着动 → 共用本振（待机时不能挪，否则感知窗口一起跑掉）。
+        """
+        cfg, uhd = self.cfg, self.uhd
+        try:
+            rx0 = self.rx_freq()
+            self.usrp.set_tx_freq(
+                uhd.libpyuhd.types.tune_request(cfg.center_freq_hz + 20e6), cfg.tx_ch)
+            time.sleep(0.08)
+            rx1 = self.rx_freq()
+            self.lo_independent = bool(abs(rx1 - rx0) < 5e3)
+        except Exception:
+            self.lo_independent = None
+        finally:
+            try:
+                self.usrp.set_tx_freq(
+                    uhd.libpyuhd.types.tune_request(cfg.center_freq_hz), cfg.tx_ch)
+                self._tx_freq = float(cfg.center_freq_hz)
+            except Exception:
+                pass
+        return self.lo_independent
+
+    def park_tx(self) -> bool:
+        """待机：把 TX 本振挪到观测频段之外，并把增益压到 0，双管齐下压泄漏。"""
+        cfg = self.cfg
+        if not cfg.park_tx_when_idle or self.lo_independent is False:
+            return False
+        try:
+            self._tune_tx(cfg.center_freq_hz + float(cfg.park_tx_offset_hz))
+            self.usrp.set_tx_gain(0.0, cfg.tx_ch)
+            self._tx_gain_now = 0.0
+            self.tx_parked = True
+            return True
+        except Exception:
+            return False
 
     def _open_streams(self) -> None:
         uhd, cfg = self.uhd, self.cfg
@@ -282,10 +350,44 @@ class UhdDualRadio(DualRadio):
             return
 
     # ── 发 ────────────────────────────────────────────────────
-    def jam(self, samples: np.ndarray, gain_db: float, duration_s: float) -> None:
+    def _tune_tx(self, freq_hz: float) -> float:
+        """把 TX 本振调到 freq_hz，返回实测频率（Hz）。"""
+        uhd, cfg = self.uhd, self.cfg
+        t0 = time.perf_counter()
+        self.usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(float(freq_hz)), cfg.tx_ch)
+        self.last_tune_ms = round((time.perf_counter() - t0) * 1e3, 2)
+        try:
+            res = self.usrp.get_tx_freq(cfg.tx_ch)
+            self._tx_freq = float(getattr(res, "actual_rf_freq", res))
+        except Exception:
+            self._tx_freq = float(freq_hz)
+        return self._tx_freq
+
+    def tx_freq(self) -> float:
+        return float(self._tx_freq)
+
+    def rx_freq(self) -> float:
+        try:
+            res = self.usrp.get_rx_freq(self.cfg.rx_ch)
+            return float(getattr(res, "actual_rf_freq", res))
+        except Exception:
+            return float(self.center_hz)
+
+    def jam(self, samples: np.ndarray, gain_db: float, duration_s: float,
+            tx_freq_hz: float | None = None) -> None:
         if not self.tx_enabled:
             return
         cfg = self.cfg
+        # 目标信道变化时才重调本振，同一信道连发不重复付调谐开销
+        if tx_freq_hz is not None and abs(float(tx_freq_hz) - self._tx_freq) > 1e3:
+            self._tune_tx(float(tx_freq_hz))
+        # 待机时增益被压到 0，恢复回去再发
+        if abs(getattr(self, "_tx_gain_now", cfg.tx_gain_fixed) - cfg.tx_gain_fixed) > 0.01:
+            try:
+                self.usrp.set_tx_gain(cfg.tx_gain_fixed, cfg.tx_ch)
+                self._tx_gain_now = float(cfg.tx_gain_fixed)
+            except Exception:
+                pass
         need = int(round(duration_s * cfg.sense_rate))
         block = np.asarray(samples, dtype=np.complex64).ravel()
         if block.size == 0:
@@ -386,6 +488,7 @@ class UhdDualRadio(DualRadio):
         self.usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(freq_hz), self.cfg.rx_ch)
         self.usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(freq_hz), self.cfg.tx_ch)
         self.center_hz = freq_hz
+        self._tx_freq = float(freq_hz)
         if self.rx_thread:
             self._min_time = max(self._min_time,
                                  self.usrp.get_time_now().get_real_secs() + 0.02)

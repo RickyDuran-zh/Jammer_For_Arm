@@ -70,6 +70,11 @@ class Tracker:
             self.events.append(ev)
             return ev
         ch = min(max(int(channel), 0), self.num_channels - 1)
+        if prev == ch:                 # 目标没变：不产生事件，避免"3→3"的假跟随
+            self.state = State.LOCKED
+            self._lost_frames = 0
+            self._reset_counters()
+            return None
         self.target, self.state = ch, State.LOCKED
         self._lost_frames = 0
         self._reset_counters()

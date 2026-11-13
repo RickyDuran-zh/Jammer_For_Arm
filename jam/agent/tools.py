@@ -1,4 +1,4 @@
-"""Agent 工具：把自然语言意图映射到控制器原语。"""
+﻿"""Agent 工具：把自然语言意图映射到控制器原语。"""
 from __future__ import annotations
 
 import json
@@ -20,7 +20,7 @@ TOOL_DEFS = [
                     "channel": {"type": "integer", "description": "初始信道 1-10，省略则自动搜索"},
                     "waveform_mode": {"type": "string", "enum": ["noise", "multitone"],
                                       "description": "noise=限带噪声，multitone=多音"},
-                    "power_db": {"type": "number", "description": "发射功率 0-20 dB"},
+                    "power_db": {"type": "number", "description": "发射功率 -30~20 dB（负值用于压低干扰强度）"},
                     "bw_khz": {"type": "number", "enum": list(BW_CHOICES_KHZ),
                                "description": "干扰带宽 kHz"},
                 },
@@ -41,7 +41,7 @@ TOOL_DEFS = [
                     "channel": {"type": "integer", "description": "信道 1-10（必填）"},
                     "waveform_mode": {"type": "string", "enum": ["noise", "multitone"],
                                       "description": "noise=限带噪声，multitone=多音"},
-                    "power_db": {"type": "number", "description": "发射功率 0-20 dB"},
+                    "power_db": {"type": "number", "description": "发射功率 -30~20 dB（负值用于压低干扰强度）"},
                     "bw_khz": {"type": "number", "enum": list(BW_CHOICES_KHZ),
                                "description": "干扰带宽 kHz"},
                 },
@@ -52,12 +52,29 @@ TOOL_DEFS = [
     {
         "type": "function",
         "function": {
+            "name": "start_random_jamming",
+            "description": "随机干扰：按固定周期随机改变目标信道、干扰功率和干扰带宽，"
+                           "不参考对方通信动作。用户说“随机干扰/随机时变/盲扫/乱压”时用这个。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period_s": {"type": "number",
+                                 "description": "参数变化周期 秒，默认 2"},
+                    "waveform_mode": {"type": "string", "enum": ["noise", "multitone"],
+                                      "description": "noise=限带噪声，multitone=多音"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "stop_tracking",
             "description": "停止跟踪并停止发射干扰。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
-    },
-    {
+    },    {
         "type": "function",
         "function": {
             "name": "set_center_frequency",
@@ -84,6 +101,10 @@ TOOL_DEFS = [
                     "waveform_mode": {"type": "string", "enum": ["noise", "multitone"]},
                     "power_db": {"type": "number"},
                     "bw_khz": {"type": "number", "enum": list(BW_CHOICES_KHZ)},
+                    "react_delay_ms": {
+                        "type": "number",
+                        "description": "响应延迟 ms：判定切频后等多久才把干扰搬过去，"
+                                       "0=立即跟随；调试时用来拉开感知→施扰的间隔"},
                 },
                 "required": [],
             },
@@ -161,6 +182,7 @@ class ToolBox:
         self.handlers = {
             "start_tracking": self.start_tracking,
             "start_fixed_jamming": self.start_fixed_jamming,
+            "start_random_jamming": self.start_random_jamming,
             "stop_tracking": self.stop_tracking,
             "set_center_frequency": self.set_center_frequency,
             "set_jam_params": self.set_jam_params,
@@ -188,7 +210,7 @@ class ToolBox:
         if channel is not None and not 1 <= int(channel) <= 10:
             return "信道必须在 1-10 之间"
         if power_db is not None and not POWER_MIN_DB <= float(power_db) <= POWER_MAX_DB:
-            return "功率必须在 0-20 dB 之间"
+            return "功率必须在 -30~20 dB 之间"
         if bw_khz is not None and float(bw_khz) not in BW_CHOICES_KHZ:
             return "带宽必须是 160/320/480/640/1600 kHz"
 
@@ -204,6 +226,15 @@ class ToolBox:
             extra.append(f"{float(bw_khz):.0f} kHz")
         return f"已开始跟踪：{what}" + ("，" + "，".join(extra) if extra else "")
 
+    def start_random_jamming(self, period_s=None, waveform_mode=None) -> str:
+        mode = _mode(waveform_mode) if waveform_mode is not None else None
+        p = 2.0 if period_s is None else max(0.2, float(period_s))
+        if not 0.2 <= p <= 60.0:
+            return "随机周期必须在 0.2-60 秒之间"
+        self.c.start_random(period_s=p, waveform_mode=mode)
+        return (f"已切换到随机干扰：每 {p:.1f} 秒随机换一次信道、功率和带宽"
+                f"（不看对方动作）。")
+
     def stop_tracking(self, **_):
         self.c.stop_tracking()
         return "已停止跟踪与干扰"
@@ -215,13 +246,22 @@ class ToolBox:
         self.c.set_center(f * 1e6)
         return f"中心频率已切换到 {f:.3f} MHz"
 
-    def set_jam_params(self, waveform_mode=None, power_db=None, bw_khz=None) -> str:
+    def set_jam_params(self, waveform_mode=None, power_db=None, bw_khz=None,
+                       react_delay_ms=None) -> str:
         mode = _mode(waveform_mode)
         if power_db is not None and not POWER_MIN_DB <= float(power_db) <= POWER_MAX_DB:
-            return "功率必须在 0-20 dB 之间"
+            return "功率必须在 -30~20 dB 之间"
         if bw_khz is not None and float(bw_khz) not in BW_CHOICES_KHZ:
             return "带宽必须是 160/320/480/640/1600 kHz"
-        self.c.set_params(mode, power_db, bw_khz)
+        delay = None
+        if react_delay_ms is not None:
+            delay = float(react_delay_ms)
+            if not 0.0 <= delay <= 3000.0:
+                return "响应延迟必须在 0-3000 ms 之间"
+        self.c.set_params(mode, power_db, bw_khz, react_delay_ms=delay)
+        if delay is not None:
+            return ("已关闭响应延迟（立即跟随）" if delay <= 0
+                    else f"响应延迟设为 {delay:.0f} ms")
         return "参数已更新"
 
     def get_trend_history(self, frames: int = 60, **_) -> str:
@@ -262,14 +302,15 @@ class ToolBox:
             f"阈值 {i['thresholds'][0]:.2f}/{i['thresholds'][1]:.2f} ｜ "
             f"释放 {i['release_frames']} 帧",
             f"运行 {i['uptime_s']:.0f} 秒 ｜ 累计发射 {i['tx_frames']} 次 ｜ "
-            f"模式 {i['mode']}",
+            f"模式 {i.get('jam_mode_name', i['mode'])}",
         ])
 
     def analyze_situation(self, **_) -> str:
         st = self.c.status()
         res = self.c.latest
-        mode = {"fixed": "固定干扰", "auto": "自动跟踪",
-                "stopped": "已停止"}.get(st.get("mode"), "-")
+        mode = ("已停止" if not st.get("tracking", True)
+                else st.get("jam_mode_name")
+                or {"fixed": "固定干扰", "auto": "响应式干扰"}.get(st.get("mode"), "-"))
         target = st.get("target_ch")
         if not st.get("tracking", True):
             state = "已停止"
@@ -310,6 +351,11 @@ class ToolBox:
             judge = "跟踪已停止，当前不发射干扰。"
         elif st.get("scanning"):
             judge = "正在扫描其他 1.6 MHz 频块，尚未锁定目标。"
+        elif target and st.get("jam_mode") == "fixed":
+            judge = f"固定在信道{target}持续压制，对方切频后不跟随。"
+        elif target and st.get("jam_mode") == "random":
+            judge = (f"随机干扰中，当前落在信道{target}，"
+                     f"{st.get('random_next_s') or 0:.0f} 秒后换一组参数。")
         elif target:
             judge = f"已锁定信道{target}并持续压制，目标切频后会自动跟随。"
         else:
